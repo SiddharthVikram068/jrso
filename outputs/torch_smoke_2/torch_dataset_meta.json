@@ -1,0 +1,23 @@
+{
+  "config": {
+    "num_users": 256,
+    "num_items": 96,
+    "latent_dim": 24,
+    "num_communities": 4,
+    "avg_intra_degree": 8,
+    "avg_inter_degree": 2,
+    "interaction_density": 0.08,
+    "min_interactions_per_user": 4,
+    "max_interactions_per_user": 10,
+    "val_ratio": 0.1,
+    "test_ratio": 0.2,
+    "k_seeds": 8,
+    "cascade_steps": 3,
+    "influence_scale": 1.3,
+    "num_eval_items": 6,
+    "evaluation_simulations": 3,
+    "seed": 17
+  },
+  "num_edges": 4882,
+  "num_train_pairs": 1282
+}

@@ -167,3 +167,82 @@ The repository was validated with:
 - `python3.12 -m jrso --preset tiny --epochs 3 --output-dir outputs/tiny_smoke`
 
 Both passed in the working environment used for this implementation.
+
+## Sparse Torch Backend
+
+The repository also now includes a second backend for larger and more realistic experiments:
+
+- sparse social graph storage instead of dense user-user matrices
+- GPU-aware training with automatic `cuda` selection when available
+- deeper residual GNNs
+- a new improved joint model: `JRSO_second`
+- direct simulator-based comparison against the baselines at larger scale
+
+### New current-repo pitfalls fixed
+
+The first implementation in this repository was intentionally lightweight, but it had practical limits for the benchmark you asked for:
+
+1. Dense user-user tensors do not scale cleanly to `10,000` users.
+2. `autograd`-based training is CPU-only and not suitable for real GPU benchmarking.
+3. The original GNN depth and hidden size were too small for a serious large-run comparison.
+4. Oracle-heavy evaluation is expensive at large scale, so the new backend compares models directly under the same simulator.
+
+The sparse torch backend fixes those limits.
+
+### New models in the torch backend
+
+#### `JRSO`
+
+- Sparse residual GNN encoder
+- Item-conditioned differentiable diffusion
+- GPU-capable training loop
+
+#### `JRSO_second`
+
+- More GNN layers and larger hidden state
+- Item-conditioned seed MLP instead of the simple seed bias formulation
+- Stronger item-aware diffusion head
+- Harder negative competition during recommendation training
+- Edge-alignment objective to better match the synthetic influence process
+
+### Large GPU preset
+
+Use this when you want the large benchmark the repository now supports:
+
+```bash
+python3.12 -m jrso --backend torch --preset large_gpu --output-dir outputs/large_gpu_run
+```
+
+The `large_gpu` preset uses:
+
+- `10,000` users
+- `1,000` items
+- sparse social graph generation
+- baseline comparisons against `RecSys-Only`, `IM-Only`, `Two-Stage`
+- both `JRSO` and `JRSO_second`
+
+### Torch smoke test
+
+```bash
+python3.12 -m jrso --backend torch --preset gpu_smoke --epochs 1 --output-dir outputs/torch_smoke
+```
+
+### Torch outputs
+
+The sparse torch backend writes:
+
+- `torch_dataset.npz`
+- `torch_dataset_meta.json`
+- `torch_metrics.csv`
+- `torch_results.json`
+- `torch_significance.json`
+- `torch_training_logs.json`
+- `torch_seed_summary.json`
+- `torch_training_curves.svg`
+- `torch_recommendation_comparison.svg`
+- `torch_influence_comparison.svg`
+- `torch_pareto_frontier.svg`
+
+### GPU installation note
+
+The code is written to use GPU when a CUDA build of PyTorch is installed. In the implementation environment here, the torch smoke test ran with a CPU wheel, but the backend itself is ready to run on GPU hardware.

@@ -1,0 +1,32 @@
+{
+  "RecSys-Only": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7089859247207642,
+      "rec_loss": 0.7089859247207642,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.035099939171844466
+    }
+  ],
+  "JRSO": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7060550451278687,
+      "rec_loss": 0.7081549167633057,
+      "spread_bonus": 0.09332805126905441,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.03409636092285499
+    }
+  ],
+  "JRSO_second": [
+    {
+      "epoch": 0.0,
+      "objective": 3.0277576446533203,
+      "rec_loss": 3.04418937365214,
+      "spread_bonus": 0.10070989280939102,
+      "edge_alignment": 0.09673346330722173,
+      "val_ndcg@10": 0.05369408047005596
+    }
+  ]
+}
