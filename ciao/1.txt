@@ -1,0 +1,24 @@
+trustnetwork.mat keys : ['trustnetwork']
+rating.mat keys       : ['rating']
+
+--- trust network ---
+shape : (111781, 2) dtype: uint16
+sample:
+ [[1 2]
+ [1 3]
+ [1 4]
+ [1 5]
+ [1 6]]
+#users in trust graph: 7317
+
+--- ratings ---
+shape : (284086, 5) dtype: int32
+sample:
+ [[1 1 1 3 1]
+ [1 2 1 4 1]
+ [1 3 2 4 1]
+ [1 4 1 5 1]
+ [1 5 1 4 1]]
+#users : 7375
+#items : 105114
+rating range: 0 to 5

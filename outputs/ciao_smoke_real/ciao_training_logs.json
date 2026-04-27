@@ -1,0 +1,80 @@
+{
+  "RecSys-Only": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7061325758695602,
+      "rec_loss": 0.7061325758695602,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.011592643776740115
+    },
+    {
+      "epoch": 1.0,
+      "objective": 0.7046170979738235,
+      "rec_loss": 0.7046170979738235,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.025074483822019503
+    },
+    {
+      "epoch": 2.0,
+      "objective": 0.7022870481014252,
+      "rec_loss": 0.7022870481014252,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.040531792822876646
+    }
+  ],
+  "JRSO": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7034537196159363,
+      "rec_loss": 0.7068387120962143,
+      "spread_bonus": 0.011283279629424214,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.016448095760292603
+    },
+    {
+      "epoch": 1.0,
+      "objective": 0.7009811252355576,
+      "rec_loss": 0.7044697999954224,
+      "spread_bonus": 0.011628921143710613,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.03640478536573358
+    },
+    {
+      "epoch": 2.0,
+      "objective": 0.6997814178466797,
+      "rec_loss": 0.7032589465379715,
+      "spread_bonus": 0.011591758811846375,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.04370638598064038
+    }
+  ],
+  "JRSO_second": [
+    {
+      "epoch": 0.0,
+      "objective": 2.8398653268814087,
+      "rec_loss": 2.8294818997383118,
+      "spread_bonus": 0.010695553151890635,
+      "edge_alignment": 0.183271124958992,
+      "val_ndcg@10": 0.015402592009295708
+    },
+    {
+      "epoch": 1.0,
+      "objective": 2.8229843974113464,
+      "rec_loss": 2.8164589405059814,
+      "spread_bonus": 0.013586819404736161,
+      "edge_alignment": 0.14950266480445862,
+      "val_ndcg@10": 0.0372884182390768
+    },
+    {
+      "epoch": 2.0,
+      "objective": 2.808251917362213,
+      "rec_loss": 2.8076900243759155,
+      "spread_bonus": 0.017512022517621517,
+      "edge_alignment": 0.09458451718091965,
+      "val_ndcg@10": 0.0426555175285516
+    }
+  ]
+}

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
+from .ciao_config import CiaoExperimentConfig
+from .ciao_experiment import run_ciao_experiment
 from .config import DatasetConfig, ExperimentConfig, TrainingConfig
 from .experiment import run_experiment
 from .torch_config import TorchExperimentConfig
@@ -12,12 +15,17 @@ from .torch_experiment import run_torch_experiment
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the JRSO benchmark and baselines.")
-    parser.add_argument("--backend", choices=["reference", "torch"], default="reference")
+    parser.add_argument("--backend", choices=["reference", "torch", "ciao"], default="reference")
     parser.add_argument("--preset", default="small")
     parser.add_argument("--output-dir", default="outputs/latest")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lambda-spread", type=float, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--ciao-dir",
+        default="ciao",
+        help="Directory containing rating.mat and trustnetwork.mat (only used when --backend=ciao).",
+    )
     return parser
 
 
@@ -49,6 +57,46 @@ def main() -> None:
             output_dir=Path(args.output_dir),
         )
         result = run_experiment(experiment_config)
+    elif args.backend == "ciao":
+        ciao_config = CiaoExperimentConfig.preset(
+            args.preset,
+            Path(args.output_dir),
+            ciao_dir=Path(args.ciao_dir),
+        )
+        if args.epochs is not None:
+            ciao_config = CiaoExperimentConfig(
+                dataset=ciao_config.dataset,
+                recsys=ciao_config.recsys.replace(epochs=args.epochs),
+                jrso=ciao_config.jrso.replace(epochs=args.epochs),
+                jrso_second=ciao_config.jrso_second.replace(epochs=args.epochs),
+                output_dir=ciao_config.output_dir,
+                recommendation_k=ciao_config.recommendation_k,
+                combined_alpha=ciao_config.combined_alpha,
+                seed=ciao_config.seed,
+            )
+        if args.lambda_spread is not None:
+            ciao_config = CiaoExperimentConfig(
+                dataset=ciao_config.dataset,
+                recsys=ciao_config.recsys,
+                jrso=ciao_config.jrso.replace(lambda_spread=args.lambda_spread),
+                jrso_second=ciao_config.jrso_second.replace(lambda_spread=args.lambda_spread),
+                output_dir=ciao_config.output_dir,
+                recommendation_k=ciao_config.recommendation_k,
+                combined_alpha=ciao_config.combined_alpha,
+                seed=ciao_config.seed,
+            )
+        if args.device is not None:
+            ciao_config = CiaoExperimentConfig(
+                dataset=ciao_config.dataset,
+                recsys=ciao_config.recsys.replace(device=args.device),
+                jrso=ciao_config.jrso.replace(device=args.device),
+                jrso_second=ciao_config.jrso_second.replace(device=args.device),
+                output_dir=ciao_config.output_dir,
+                recommendation_k=ciao_config.recommendation_k,
+                combined_alpha=ciao_config.combined_alpha,
+                seed=ciao_config.seed,
+            )
+        result = run_ciao_experiment(ciao_config)
     else:
         experiment_config = TorchExperimentConfig.preset(args.preset, Path(args.output_dir))
         if args.epochs is not None:
