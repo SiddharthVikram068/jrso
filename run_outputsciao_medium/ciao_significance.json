@@ -1,0 +1,17 @@
+{
+  "JRSO_second_vs_RecSys-Only_weighted_spread": {
+    "observed_mean_difference": 77.64566098681341,
+    "p_value": 0.0014992503748125937,
+    "significant": true
+  },
+  "JRSO_second_vs_IM-Only_weighted_spread": {
+    "observed_mean_difference": 10.764510176454982,
+    "p_value": 0.0009995002498750624,
+    "significant": true
+  },
+  "JRSO_vs_RecSys-Only_weighted_spread": {
+    "observed_mean_difference": 75.1751411917309,
+    "p_value": 0.001999000499750125,
+    "significant": true
+  }
+}
