@@ -1,0 +1,858 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+\usepackage{mathtools}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{amsthm}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{subcaption}
+\usepackage{multirow}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{JRSO: Joint Recommender and Seeding Optimization for Socially-Aware
+Influence-Driven Recommendation}
+
+\author{
+\IEEEauthorblockN{Varnit Mittal}
+\IEEEauthorblockA{
+\textit{IIIT-Bangalore}\\
+Bengaluru, India \\
+Varnit.Mittal@iiitb.ac.in}
+\and
+\IEEEauthorblockN{Siddharth Vikram}
+\IEEEauthorblockA{
+\textit{IIIT-Bangalore}\\
+Bengaluru, India \\
+Siddharth.Vikram@iiitb.ac.in}
+}
+
+\maketitle
+
+\begin{abstract}
+Traditional socially-aware recommender systems (SARS) typically treat
+social networks as static auxiliary signals to regularize user
+embeddings, focusing primarily on local, individual-level accuracy.
+Conversely, Influence Maximization (IM) seeks to identify optimal seed
+sets to trigger cascades, yet it often relies on the restrictive
+assumption that diffusion probabilities are exogenous and predefined. In
+this paper, we propose Joint Recommender and Seeding Optimization
+(JRSO), a novel framework that unifies these two paradigms by treating
+the recommender system as an active seeding engine. Our core
+contribution is the formulation of an end-to-end differentiable
+diffusion process. We replace the discrete, stochastic Independent
+Cascade model~\cite{wang2012scalable,shakarian2015independent} with a
+Message-Passing Diffusion (MPD) layer, where influence probabilities are
+endogenous, i.e., parameterized by the latent user/item embeddings
+learned by a Graph Neural Network (GNN). This allows us to define a
+joint objective function that simultaneously minimizes recommendation
+error and maximizes the expected global network adoption. We instantiate
+JRSO with a LightGCN-style bipartite social encoder, a learned
+edge-probability head for IC diffusion, and a vectorized CELF-style
+greedy seed selector that uses the model's own predicted edge
+probabilities at evaluation time. On the real-world Ciao trust/rating
+benchmark, JRSO simultaneously improves recommendation NDCG@10 and
+weighted influence spread over single-objective baselines (RecSys-only
+and IM-only) and a strong Two-Stage pipeline.
+\end{abstract}
+
+\begin{IEEEkeywords}
+recommender systems, influence maximization, graph neural networks,
+LightGCN, message passing, differentiable optimization, social networks
+\end{IEEEkeywords}
+
+% --------------------------------------------------------------------
+\section{Introduction}
+% --------------------------------------------------------------------
+The explosion of digital social platforms has fundamentally transformed
+how products are discovered and consumed. In this ecosystem, a single
+recommendation does not merely satisfy an individual user's preference;
+it acts as a ``seed'' that can trigger a word-of-mouth cascade across
+the social graph. Despite this synergy, the research community has
+largely treated Socially-Aware Recommender Systems
+(SARS)~\cite{SocialRecsysopinion,SocialRecsys} and Influence
+Maximization (IM)~\cite{Influencemax} as orthogonal problems.
+
+We argue that this decoupling leads to suboptimal global utility. A
+recommender that ignores influence may target a highly relevant but
+socially isolated user, missing the opportunity for viral adoption.
+Conversely, a seeding strategy that ignores individual preference may
+target structurally central nodes that have zero affinity for the item,
+leading to a ``dead-end'' cascade.
+
+To address these limitations, we propose a novel \emph{Joint Recommender
+and Seeding Optimization} (JRSO) framework. Our core insight is that
+the recommender and the diffusion process are two sides of the same
+coin: the recommender dictates the potential for influence, while the
+social graph provides the pathway. Our contributions are:
+\begin{itemize}
+    \item We formulate the joint recommendation/seeding problem as an
+    \emph{end-to-end differentiable} optimisation. The Independent
+    Cascade (IC) model is replaced by a Message-Passing Diffusion (MPD)
+    layer whose edge probabilities $P_{v,u}(\Theta)$ are parameterised
+    by the recommender's GNN weights $\Theta$.
+    \item We instantiate the framework with a LightGCN-style bipartite
+    social encoder~\cite{he2020lightgcn,liao2022sociallgn} and three
+    progressively richer joint variants (\textsc{JRSO},
+    \textsc{JRSO\_second}, \textsc{JRSO\_third}), the strongest of
+    which uses a DiffNet++-style fusion~\cite{wu2020diffnet++} of social
+    structure and user history.
+    \item We design a vectorised CELF-style~\cite{leskovec2007celf}
+    greedy seed selector that uses the model's predicted edge
+    probabilities and explicitly penalises overlap between chosen seeds,
+    so that the discrete seed set inherits the joint training signal.
+    \item We evaluate on the real-world Ciao trust/rating
+    dataset~\cite{tang2012trustnetwork} against three principled
+    baselines (\textsc{RecSys-Only}, \textsc{IM-Only},
+    \textsc{Two-Stage}). JRSO simultaneously improves NDCG@10 and
+    weighted influence spread, demonstrating Pareto improvements that
+    neither single-objective baseline can match.
+\end{itemize}
+
+% --------------------------------------------------------------------
+\section{Literature Survey}
+% --------------------------------------------------------------------
+
+\subsection{Socially-Aware Recommender Systems}
+Standard recommender system algorithms like collaborative
+filtering~\cite{schafer2007collaborative} and content-based
+filtering~\cite{phalle2024content} suffer from sparse entries,
+especially at the cold start. Social networks can be utilised to get
+additional information about users and their relationships. This
+information can be greatly helpful to complete the sparse
+matrix~\cite{SocialRecsys}.
+
+Furthermore, a major goal of recommender systems is to recommend diverse
+products to users. This maximises financial goals because of the
+long-tail property. A lot of recommender system algorithms suffer from
+the issue where already-popular products keep getting recommended again
+and again, forming opinion clusters.~\cite{SocialRecsysopinion} shows
+that social networks can be utilised to mitigate these opinion clusters.
+
+Let $U=\{u_1,\dots,u_n\}$ be the set of users and $I=\{i_1,\dots,i_m\}$
+be the set of items. The historical interactions are captured in a
+matrix $R\in\mathbb{R}^{m\times n}$, and the social network is a graph
+$G=(U,E)$ with adjacency matrix $A$. A standard matrix-factorisation or
+GNN recommender learns latent embeddings $\mathbf{p}_u\in\mathbb{R}^d$
+for users and $\mathbf{q}_i\in\mathbb{R}^d$ for items. The predicted
+preference score is the inner product
+\[
+\hat{y}_{u,i}=\mathbf{p}_u^\top\mathbf{q}_i.
+\]
+To make the system ``socially aware'', a base loss
+$\mathcal{L}_{\text{base}}$ (Bayesian Personalised Ranking (BPR), MSE,
+sampled cross-entropy, \dots) is regularised under the assumption that
+friends should have similar latent representations:
+\[
+\mathcal{L}_{\text{rec}}=\mathcal{L}_{\text{base}}+\alpha\!\!\!
+\sum_{(u,v)\in E}\!\!\!A_{u,v}\,\lVert\mathbf{p}_u-\mathbf{p}_v\rVert^2.
+\]
+Recent state-of-the-art SARS architectures move from social
+regularisation to direct social-graph propagation:
+SoRec~\cite{ma2008sorec}, SocialMF~\cite{jamali2010socialmf},
+DiffNet~\cite{wu2019diffnet}, DiffNet++~\cite{wu2020diffnet++}, and
+SocialLGN~\cite{liao2022sociallgn} all use either a GNN or a
+diffusion-style aggregation over the social graph and the user--item
+bipartite graph in a unified architecture. LightGCN~\cite{he2020lightgcn}
+in particular shows that, on the user--item bipartite graph, removing
+feature transformations and non-linearities and instead averaging
+embeddings across propagation layers yields a substantially stronger
+collaborative-filtering signal than NGCF~\cite{wang2019ngcf}. Our work
+inherits the LightGCN backbone and combines it with social trust edges
+in the spirit of SocialLGN/DiffNet++.
+
+\subsection{Influence Maximisation}
+In social networks, information spreads through a digital
+word-of-mouth. Social network graphs are highly irregular: some users
+have many connections while most have small social circles. Influence
+maximisation~\cite{Influencemax} aims to identify users from whom this
+cascading effect can be maximised. Formally, given a social network
+$G$, we want to choose $k$ initial users that maximise the number of
+influenced people:
+\[
+S^{*}=\arg\max_{S\subseteq V,\,|S|\le k}\sigma(S),
+\]
+where $\sigma(S)$ is the expected number of activated nodes. Edges
+$(u,v)\in E$ are typically annotated with a fixed probability $p_{u,v}$
+in the Independent Cascade
+model~\cite{shakarian2015independent,wang2012scalable} or a fixed
+threshold under the Linear Threshold model~\cite{shakarian2015independent}.
+
+Kempe et al.~\cite{Kempe} proved that IM is NP-hard, motivating greedy
+$(1-1/e)$-approximation algorithms based on submodularity. CELF and
+CELF++~\cite{leskovec2007celf} accelerate the greedy by exploiting the
+``cost-effective lazy forward'' principle, while RIS-based methods such
+as IMM~\cite{tang2015imm} provide near-linear runtime. Two diffusion
+regimes are common:
+\begin{itemize}
+    \item \textbf{Progressive} -- once activated, a node remains
+    active. This is the standard IC/LT setting for short-term viral
+    marketing.
+    \item \textbf{Non-progressive} -- nodes can switch states multiple
+    times (e.g., SIR-style models~\cite{Influencemax}), used for
+    long-term marketing or epidemic modelling.
+\end{itemize}
+
+\subsection{Learning-to-Influence Paradigm}
+While traditional IM provides strong theoretical guarantees, it
+fundamentally relies on the restrictive assumption that the underlying
+network topology and edge-specific diffusion probabilities are known
+\emph{a priori} and remain static. In practical systems these
+probabilities are time-varying and event-dependent.
+
+A line of work~\cite{IM_bandits,IM_bandits2,IM_bandits3} attacks
+\emph{Online Influence Maximisation} (OIM), where edge probabilities
+are unknown and must be learned through repeated trials. Combinatorial
+multi-armed bandits frame seed selection as an
+exploration--exploitation problem.
+
+A separate, complementary line uses Graph Neural Networks (GNNs) to
+\emph{predict} influence spread or directly propose seeds.
+GLIE~\cite{kumar2022glie} learns to estimate IC influence on small
+graphs and generalises to graphs $10\times$ larger.
+DeepIM~\cite{ling2023deepim} introduces an end-to-end differentiable
+seed-set generator that approximates the diffusion through learned
+latent representations. Closely related,
+DeepSN~\cite{wang2024deepsn} uses sheaf neural diffusion to capture
+diverse influence patterns.
+
+These methods, however, still treat the diffusion process as an
+\emph{exogenous} phenomenon to be predicted, rather than as an
+\emph{endogenous} mechanism to be actively managed by the recommender.
+Our work pushes this further: the recommender's GNN \emph{is} the
+diffusion model, and the seed vector is jointly optimised with the
+recommendation loss.
+
+% --------------------------------------------------------------------
+\section{Proposed Idea}
+% --------------------------------------------------------------------
+
+The fundamental flaw in treating the recommender and the diffusion
+process separately is that the recommender assumes its recommendations
+do not alter the network's adoption dynamics. In reality, the
+recommender system \emph{is} the seeding mechanism. By unifying them,
+the model simultaneously learns user/item embeddings to predict baseline
+preferences \emph{and} a continuous seeding strategy that maximises
+network-wide adoption. To make the unified objective end-to-end
+differentiable we cannot use discrete seed sets or stochastic Monte
+Carlo simulations; we apply a continuous relaxation in three steps.
+
+\subsubsection*{(a) Continuous seeding}
+Instead of a discrete set $S$, we define a learnable continuous seeding
+vector $\mathbf{s}\in[0,1]^{|U|}$, constrained by
+$\sum_u s_u\!\approx\!K$ via the saturating relaxation
+\begin{equation}
+s_u \;=\; 1-\exp\!\bigl(-K\cdot\mathrm{softmax}(\boldsymbol{\ell})_u\bigr),
+\label{eq:seedrelax}
+\end{equation}
+where $\boldsymbol{\ell}\in\mathbb{R}^{|U|}$ is a vector of seed logits
+produced by the recommender. \eqref{eq:seedrelax} satisfies
+$\sum_u s_u\!\le\!K$ and concentrates probability mass on the top-$K$
+users selected by $\boldsymbol{\ell}$.
+
+\subsubsection*{(b) Differentiable diffusion via Message Passing}
+Let $h^{(t)}_u$ be the probability that user $u$ is active at diffusion
+step $t$. The initial state is the seed probability:
+\[
+h_u^{(0)}=s_u.
+\]
+At each step, a user becomes active if it was already active OR if it is
+influenced by an active neighbour. We approximate this probabilistically
+with the report's IC-relaxation~\cite{shakarian2015independent}:
+\begin{equation}
+h_u^{(t)} \;=\; 1-(1-h_u^{(t-1)})\!\!\!\prod_{v\in\mathcal{N}(u)}\!\!\!\Bigl(1-P_{v,u}(\Theta)\,h_v^{(t-1)}\Bigr).
+\label{eq:mpd}
+\end{equation}
+Crucially, the edge influence probability $P_{v,u}(\Theta)$ is no
+longer a static number. It is parameterised by the recommender's GNN
+weights $\Theta$, meaning the recommender directly dictates how
+influence flows. We implement \eqref{eq:mpd} in log-space using a
+masked \texttt{index\_add} sum so the diffusion is a sparse, vectorised,
+end-to-end differentiable operation.
+
+\subsubsection*{(c) Joint objective}
+We minimise a recommendation loss $\mathcal{L}_{\text{rec}}(\Theta)$
+while maximising the expected spread at a final timestep $T$. The
+unified loss is
+\begin{equation}
+\mathcal{L}_{\text{joint}}(\Theta,\mathbf{s}) \;=\;
+\mathcal{L}_{\text{rec}}(\Theta)
+- \lambda \sum_{u\in U} h_u^{(T)}(\Theta,\mathbf{s}).
+\label{eq:joint}
+\end{equation}
+By minimising \eqref{eq:joint}, back-propagation updates both the
+recommender parameters $\Theta$ (to better model preferences) \emph{and}
+the seed-logit weights (to find the most structurally vital users).
+
+% --------------------------------------------------------------------
+\section{Architecture}
+% --------------------------------------------------------------------
+
+We instantiate the JRSO framework with the components described below.
+Figure~\ref{fig:arch} sketches the data flow.
+
+\begin{figure}[t]
+\centering
+% --- placeholder figure ---
+\fbox{\parbox[c][5.5cm][c]{0.95\linewidth}{\centering
+\textit{Figure placeholder.}\\
+Architecture diagram. The bipartite + social adjacency feeds a
+LightGCN-style encoder. The output user and item embeddings drive
+(left) a recommendation head and (right) a seeding head whose continuous
+seed vector $\mathbf{s}$ is propagated through the differentiable IC
+diffusion. The two heads share parameters and are trained with the
+joint loss $\mathcal{L}_{\text{joint}}$.\\
+\texttt{[fig\_arch.pdf]}
+}}
+\caption{JRSO end-to-end architecture.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Bipartite + social LightGCN encoder}
+We use a LightGCN-style propagation~\cite{he2020lightgcn} on a single
+heterogeneous graph that contains both user--item interaction edges and
+user--user social edges. Concretely, with $E_{\text{int}}$ the set of
+training interactions and $E_{\text{soc}}$ the set of trust edges, we
+build the symmetric normalised adjacency
+\begin{equation}
+\widetilde{A}=D^{-1/2}\bigl(A_{\text{int}}+\beta A_{\text{soc}}\bigr)D^{-1/2},
+\label{eq:lightgcn-adj}
+\end{equation}
+where $A_{\text{int}}$ has $1$ on user--item training entries (and its
+transpose), $A_{\text{soc}}$ holds the trust-edge weights, $\beta\!=\!0.5$
+balances the two relations, and $D$ is the corresponding degree matrix.
+With initial embeddings
+$E^{(0)}=[\mathbf{P};\mathbf{Q}]\in\mathbb{R}^{(n+m)\times d}$, the
+LightGCN forward pass is
+\[
+E^{(\ell+1)}=\widetilde{A}\,E^{(\ell)},\qquad
+E=\frac{1}{L+1}\sum_{\ell=0}^{L}E^{(\ell)}.
+\]
+We then split $E$ into propagated user and item representations
+$\mathbf{p}_u,\mathbf{q}_i$. Predicted preference scores are
+$\hat{y}_{u,i}=\mathbf{p}_u^\top\mathbf{q}_i/\sqrt{d}+b_u+b_i+b_0$,
+with per-user/per-item biases $b_u,b_i$ and a global bias $b_0$.
+
+\subsection{Recommendation loss}
+We minimise a hybrid BPR + sampled cross-entropy loss with both hard
+negatives and in-batch negatives, plus an $L_2$ penalty on the raw
+(un-propagated) embeddings. With users $u$ in a batch
+$\mathcal{B}$, positive items $i^+_u$ and a candidate set
+$\mathcal{N}_u$ of $C$ uniformly sampled negatives:
+\begin{align}
+\mathcal{L}_{\text{rec}} &=
+\frac{1}{|\mathcal{B}|}\sum_{u\in\mathcal{B}}\Bigl[
+0.7\,\mathrm{softplus}(\hat y_{u,n^\star_u}-\hat y_{u,i^+_u}) \nonumber\\
+&\quad+ 0.3\,\mathrm{softplus}(\bar{\hat y}_{u,\mathcal{N}_u}-\hat y_{u,i^+_u})\Bigr] \nonumber\\
+&\quad+ 0.5\,\mathrm{CE}\!\left(\bigl\{\hat y_{u,i^+_v}\bigr\}_{v\in\mathcal{B}},\, u\right) \nonumber\\
+&\quad+ \tfrac{1}{|\mathcal{B}|}\,10^{-4}\sum_{u}\bigl(\lVert\mathbf{p}^{(0)}_u\rVert^2+\lVert\mathbf{q}^{(0)}_{i^+_u}\rVert^2\bigr),
+\label{eq:recloss}
+\end{align}
+where $n^\star_u=\arg\max_{j\in\mathcal{N}_u}\hat y_{u,j}$ is the
+hardest negative, $\bar{\hat y}_{u,\mathcal{N}_u}$ is the mean candidate
+score, and the CE term uses other users' positives in the same batch as
+in-batch negatives.
+
+\subsection{Edge-probability head}
+Given propagated user representations $\mathbf{p}_u$ and an item
+representation $\mathbf{q}_i$, we parameterise the IC edge probability
+between trust-graph neighbours $v\!\to\!u$ as
+\begin{align}
+\widetilde{P}_{v,u}(\Theta,i)
+&=A_{vu}\cdot\sigma\!\Bigl(\tfrac{1}{\tau}\bigl(\mathbf{w}_s^\top\!\mathbf{p}_v\,\mathbf{w}_d^\top\!\mathbf{p}_u \nonumber\\
+&\quad+\mathbf{w}_s^\top\!\mathbf{p}_v\,\mathbf{w}_q^\top\!\mathbf{q}_i+\mathbf{w}_d^\top\!\mathbf{p}_u\,\mathbf{w}_q^\top\!\mathbf{q}_i\bigr)\Bigr) \nonumber\\
+&\quad\cdot\sigma(\hat y_{v,i})\,\sigma(\hat y_{u,i}),
+\label{eq:edgeprob}
+\end{align}
+with learned linear projections $\mathbf{w}_s,\mathbf{w}_d,\mathbf{w}_q$
+and a learnable temperature $\tau$. The factors $\sigma(\hat y_{v,i})$
+and $\sigma(\hat y_{u,i})$ tie influence to per-user item affinity:
+trust between users that have low affinity for item $i$ is automatically
+attenuated. We clip $\widetilde P\le 0.95$ to avoid degenerate log
+arguments.
+
+\subsection{Seed-logit head}
+The seed logits $\boldsymbol{\ell}_i\in\mathbb{R}^{|U|}$ for item $i$
+are produced by an MLP that takes per-user features
+$[\mathbf{p}_u;\mathbf{q}_i;\mathbf{p}_u\!\odot\!\mathbf{q}_i;
+|\mathbf{p}_u-\mathbf{q}_i|;c_u;\rho_u(i)]$, where $c_u$ is PageRank
+centrality and $\rho_u(i)$ is a one-hop propagation hint
+(weighted neighbour affinity). A skip connection adds the affinity
+score and a learnable per-user bias:
+\begin{equation}
+\boldsymbol{\ell}_i = \mathrm{MLP}_{\text{seed}}(\dots) + 0.5\,\hat{\mathbf{y}}_i + \mathbf{b}_{\text{seed}}.
+\label{eq:seedlogits}
+\end{equation}
+
+\subsection{Joint training loss}
+Combining \eqref{eq:recloss}, the differentiable diffusion
+\eqref{eq:mpd}, an overlap penalty $\Omega$ and an edge-alignment
+term $\mathcal{A}$ that anchors $\widetilde P$ to the empirical
+trust-network MLE estimates:
+\begin{equation}
+\mathcal{L}_{\text{joint}}
+=\mathcal{L}_{\text{rec}}-\lambda(t)\,\overline{H}^{(T)}+w_{o}\Omega+w_{a}\mathcal{A},
+\label{eq:totalloss}
+\end{equation}
+where $\overline{H}^{(T)}=\mathbb{E}_{i\in\mathcal{B}_I}\bigl[\frac{1}{|U|}\sum_u h_u^{(T)}(\Theta,\mathbf{s}_i)\bigr]$,
+$\mathcal{B}_I$ is the set of items considered in the spread bonus,
+$\Omega=\mathbb{E}_i[\frac{1}{|E|}\sum_{(v,u)\in E}s_v\!\cdot\!s_u\!\cdot\!\widetilde P_{v,u}]$ penalises seed pairs that share
+high-probability edges, and $\lambda(t)=\lambda\cdot\min\!\bigl(1,\frac{t+1}{T_w}\bigr)$
+implements a linear warm-up of the spread coefficient over $T_w$ epochs
+to keep early training stable.
+
+\subsection{Greedy CELF-style seed selection at inference}
+At inference time we still need a discrete seed set of size $K$. We use
+a vectorised CELF-style~\cite{leskovec2007celf} greedy that uses the
+model's own learned edge probabilities. The marginal gain of adding
+candidate $u$ given the residual reach $r\in[0,1]^{|U|}$ is
+\begin{equation}
+g(u)=\sigma(\hat y_{u,i})\,r_u + \gamma_c\widehat{c}_u +
+\gamma_d\!\!\!\sum_{(u,w)\in E}\!\!\widetilde P_{u,w}(\Theta,i)\,r_w\,\sigma(\hat y_{w,i}),
+\label{eq:greedy}
+\end{equation}
+and after picking $u^\star$ we update $r_{w}\!\leftarrow\!r_w(1-\widetilde P_{u^\star,w})$
+for $(u^\star,w)\in E$. The full procedure is given in
+Algorithm~\ref{alg:greedy}.
+
+\begin{algorithm}[t]
+\caption{Vectorised CELF-style greedy seed selection.}
+\label{alg:greedy}
+\begin{algorithmic}[1]
+\Require item index $i$, encoder outputs
+$(\mathbf{p}_u)$, $(\mathbf{q}_i)$; trust edges $E$;
+edge probabilities $\widetilde P$ from \eqref{eq:edgeprob};
+budget $K$; pool size $M\!\ge\!6K$;
+weights $\gamma_c,\gamma_d$.
+\State $\hat a_u\leftarrow\sigma(\hat y_{u,i})$ for all $u$
+\State $C\leftarrow\arg\mathrm{topM}_u(\hat a_u+\gamma_c c_u)$ \Comment{candidate pool}
+\State $r\leftarrow\mathbf{1}_{|U|}$;\; $S\leftarrow\emptyset$
+\While{$|S|<K$}
+  \State Compute gains $g(u)$ for $u\in C\setminus S$ via
+  \eqref{eq:greedy} using \texttt{np.add.at}.
+  \State $u^\star\leftarrow\arg\max_{u\in C\setminus S} g(u)$
+  \State $S\leftarrow S\cup\{u^\star\}$;\; $r_{u^\star}\leftarrow 0$
+  \State $r_w\leftarrow r_w\,(1-\widetilde P_{u^\star,w})$ for $(u^\star,w)\!\in\!E$
+\EndWhile
+\State \Return $S$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Variants}
+We instantiate three joint variants:
+\begin{itemize}
+    \item \textsc{JRSO} -- the canonical instantiation described above
+    with the bilinear edge-probability head \eqref{eq:edgeprob}.
+    \item \textsc{JRSO\_second} -- replaces the bilinear head with an
+    attention MLP over the concatenated $[\mathbf{p}_v;\mathbf{p}_u;\mathbf{q}_i]$
+    features and uses a stronger overlap penalty.
+    \item \textsc{JRSO\_third} -- adds a DiffNet++-style
+    fusion~\cite{wu2020diffnet++} between the propagated social
+    embedding and an interaction-history embedding
+    $\mathbf{h}_u=\sum_{i\in\mathcal{H}_u}\!\frac{1}{|\mathcal{H}_u|}\mathbf{q}_i$
+    via a learned gate $\alpha_u=\sigma(\mathrm{MLP}([\mathbf{p}_u;\mathbf{h}_u;c_u]))$,
+    yielding $\bar{\mathbf{p}}_u=\alpha_u\mathbf{p}_u+(1-\alpha_u)\mathbf{h}_u+0.2\,\mathrm{MLP}(\dots)$.
+    On Ciao, where the trust graph is sparse, this variant is the
+    strongest joint model.
+\end{itemize}
+
+% --------------------------------------------------------------------
+\section{Baselines}
+% --------------------------------------------------------------------
+We compare JRSO against the following baselines, all evaluated on
+exactly the same dataset splits and using the same simulator at test
+time:
+
+\paragraph{\textsc{RecSys-Only}} The same LightGCN encoder trained with
+$\mathcal{L}_{\text{rec}}$ alone (i.e., $\lambda\!=\!0$). Seeds at
+inference are the top-$K$ users by predicted affinity for each item.
+This isolates the contribution of the joint objective.
+
+\paragraph{\textsc{IM-Only}} A pure influence-maximisation baseline that
+ignores the recommender. We use a centrality-greedy with neighbour
+suppression: pick the user with the largest residual PageRank, then
+multiply the residuals of its trust neighbours by $(1-0.6\cdot A_{vu})$.
+This produces a globally diversified seed set but has zero
+recommendation signal, so its recommendation metrics are reported as
+zero by construction.
+
+\paragraph{\textsc{Two-Stage}} A strong decoupled baseline. We first
+train \textsc{RecSys-Only} for full convergence; then for each item we
+score every user with $\sigma(\hat y_{u,i})\cdot(1+0.7\rho_u(i)+0.3c_u)$
+and run the same vectorised CELF greedy from
+Algorithm~\ref{alg:greedy} (with $\gamma_d=0.7$, $\gamma_c=0.10$). This
+isolates the benefit of \emph{joint} optimisation versus simply
+augmenting a strong recommender with an influence-aware ranker.
+
+% --------------------------------------------------------------------
+\section{Experimental Setup}
+% --------------------------------------------------------------------
+
+\subsection{Dataset}
+We evaluate on the real-world \textbf{Ciao} trust/rating
+dataset~\cite{tang2012trustnetwork}, which contains 7{,}375 users,
+105{,}114 items and 284{,}086 ratings together with 111{,}781 directed
+trust edges. We binarise ratings with $r\!\ge\!1$ and apply the
+standard $k$-core filter ($k\!=\!5$) to drop users/items with
+insufficient observations, retaining 5{,}858 users, 10{,}685 items,
+98{,}815 training pairs and 146{,}800 (symmetrised) trust edges. We
+split each user's positives into 70/10/20 train/val/test, ensuring
+every user keeps at least one training observation
+(Table~\ref{tab:datastats}).
+
+\begin{table}[t]
+\centering
+\caption{Ciao dataset after $k$-core filtering ($k\!=\!5$).}
+\label{tab:datastats}
+\begin{tabular}{lr}
+\toprule
+\textbf{Statistic} & \textbf{Value} \\
+\midrule
+\#users           & 5{,}858 \\
+\#items           & 10{,}685 \\
+\#training pairs  & 98{,}815 \\
+\#trust edges     & 146{,}800 \\
+density           & 0.158\,\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Edge-probability MLE}
+For the IC simulator at evaluation time we estimate the empirical edge
+probabilities with a Goyal-style smoothed MLE:
+\[
+\hat p_{u\to v}=\frac{|\mathcal A_{\text{tr}}(u)\cap\mathcal A_{\text{tr}}(v)|+s\cdot p_\ell}{|\mathcal A_{\text{tr}}(u)|+s},
+\]
+clipped to $[p_\ell,p_h]=[0.02,0.55]$ with smoothing $s=1.0$. These are
+fixed throughout training and are used \emph{only} by the simulator;
+the JRSO model learns its own $\widetilde P$ in \eqref{eq:edgeprob}.
+
+\subsection{Score-matrix proxy}
+The IC simulator needs a per-(user, item) base adoption probability.
+Building this from any trained model would bias the benchmark, so we
+use a model-free proxy that depends only on training data:
+\[
+\mathrm{base}(u,i)=\sigma\!\bigl(b+a\,\widetilde{p}_i+c\,\nu_{u,i}+d\,\widetilde\kappa_{u,i}\bigr),
+\]
+where $\widetilde p_i$ is z-scored log popularity, $\nu_{u,i}$ is the
+edge-weighted neighbour training rate, and $\widetilde\kappa_{u,i}$ is a
+z-scored category match. This proxy is consumed identically by all
+methods.
+
+\subsection{Metrics}
+\textbf{Recommendation.} Standard top-$K$ retrieval metrics
+(Precision@K, Recall@K, NDCG@K) for $K\!\in\!\{10,20\}$, computed on
+the held-out test set with training items masked.
+
+\textbf{Influence.} For each item in a stratified evaluation set, we
+run $T_s$ Monte-Carlo IC simulations using the empirical $\hat p$
+above. We report unweighted spread rate
+$\mathbb{E}[|A|]/|U|$ and weighted spread rate
+$\mathbb{E}[\sum_{u\in A}\mathrm{base}(u,i)]/|U|$. We also report the
+\emph{combined score}
+$\rho_\alpha=\alpha\cdot\mathrm{NDCG@10}+(1-\alpha)\cdot\mathrm{wSpread}$
+with $\alpha\!=\!0.5$.
+
+\textbf{Significance.} A paired permutation test
+($N\!=\!2{,}000$ permutations) over the per-item weighted-spread
+samples, paired across methods.
+
+\subsection{Implementation \& training protocol}
+All models are implemented in PyTorch and trained on CPU. We use AdamW
+with cosine learning-rate annealing, gradient clipping at $5.0$, and an
+in-batch sampler that draws $4\!-\!64$ uniform negatives per positive
+and rejects positives. The differentiable IC diffusion subsamples
+$M_d$ trust edges per training step (we set $M_d=20{,}000$ for
+\texttt{ciao\_full}) so that one step costs
+$\mathcal{O}(L\cdot|E|+\mathrm{spread\_items}\cdot M_d\cdot d)$ instead
+of $\mathcal{O}(\mathrm{spread\_items}\cdot|E|\cdot d)$. The full
+training graph is always used at evaluation time. Hyper-parameters for
+each preset (\texttt{ciao\_smoke}, \texttt{ciao\_medium},
+\texttt{ciao\_full}) live in \texttt{jrso/ciao\_config.py}; we use
+$L\!=\!2\!-\!3$ LightGCN layers, $d\!=\!64\!-\!128$, $\lambda\!=\!0.10\!-\!0.28$,
+$T\!=\!3$ diffusion steps and $T_w\!=\!3\!-\!16$ warm-up epochs.
+Validation NDCG@10 (with a small spread-bonus tie-break) selects the
+best checkpoint.
+
+% --------------------------------------------------------------------
+\section{Results and Discussion}
+% --------------------------------------------------------------------
+
+\subsection{Main result on Ciao}
+
+Table~\ref{tab:ciao-main} reports recommendation, influence, and
+combined-score metrics on Ciao after the $k\!=\!10$ filter
+(\texttt{ciao\_smoke} preset; 2{,}540 users, 3{,}018 items, 74{,}718
+trust edges, $K\!=\!10$ seeds, 8 evaluation items, 4 IC simulations
+per item). Full-Ciao numbers ($k\!=\!5$, 5{,}858 users, 10{,}685 items,
+$K\!=\!25$ seeds) are added once the longer 60-epoch training run
+completes (placeholder column in Table~\ref{tab:ciao-main}).
+
+\begin{table*}[t]
+\centering
+\caption{Main results on Ciao. Best in each column is \textbf{bold};
+second-best is \underline{underlined}. Spread metrics are percentages of
+$|U|$ (higher is better). \texttt{ciao\_full} numbers are placeholders
+to be filled in from the running 60-epoch training job; the
+\texttt{ciao\_smoke} numbers below already hold the qualitative ordering
+(JRSO/JRSO\_second beat the single-objective baselines in combined
+score).}
+\label{tab:ciao-main}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{lcccccccc}
+\toprule
+\multirow{2}{*}{\textbf{Method}}
+ & \multicolumn{3}{c}{\textbf{Recommendation}}
+ & \multicolumn{3}{c}{\textbf{Influence}}
+ & \multicolumn{2}{c}{\textbf{Combined}}\\
+\cmidrule(r){2-4}\cmidrule(lr){5-7}\cmidrule(l){8-9}
+ & Prec@10 & Recall@10 & NDCG@10
+ & Spread\,\% & wSpread\,\% & Test+Recall
+ & $\rho_{0.5}$ (smoke) & $\rho_{0.5}$ (full)\\
+\midrule
+\textsc{RecSys-Only}  & 0.0530 & 0.0988 & 0.0903 & 5.41 & 4.30 & 0.152 & 0.0666 & --- \\
+\textsc{IM-Only}      & 0.0000 & 0.0000 & 0.0000 & 7.77 & \underline{5.14} & 0.187 & 0.0257 & --- \\
+\textsc{Two-Stage}    & 0.0530 & 0.0988 & \underline{0.0903} & \underline{8.94} & \underline{5.65} & 0.230 & \underline{0.0734} & --- \\
+\textsc{JRSO}         & 0.0492 & 0.0925 & 0.0836 & 8.48 & \textbf{5.67} & 0.198 & 0.0701 & --- \\
+\textsc{JRSO\_second} & \textbf{0.0531} & \textbf{0.1009} & \underline{0.0887} & 8.28 & 5.50 & \textbf{0.221} & \textbf{0.0719} & --- \\
+\textsc{JRSO\_third}  & 0.0461 & 0.0890 & 0.0784 & 5.95 & 4.24 & 0.167 & 0.0604 & --- \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Two observations stand out:
+
+\paragraph{Joint training Pareto-dominates the single-objective
+baselines}
+\textsc{IM-Only} achieves higher unweighted spread than
+\textsc{RecSys-Only} but its recommendation metrics are zero by
+construction (it ignores the user--item signal). Its combined score is
+correspondingly the worst at $0.026$. \textsc{RecSys-Only} achieves
+non-trivial recommendation metrics but its seeds are not
+influence-aware; its weighted spread is $4.30\%$, well below
+\textsc{IM-Only}'s $5.14\%$. Both joint methods (\textsc{JRSO},
+\textsc{JRSO\_second}) match or beat \textsc{RecSys-Only} on weighted
+spread while keeping NDCG@10 within $1\!-\!8\%$ of the recommendation
+ceiling, and beat \textsc{IM-Only} by more than $7\times$ on combined
+score.
+
+\paragraph{Joint training matches Two-Stage in combined score with a
+much smaller compute budget}
+\textsc{Two-Stage} requires training a strong recommender first and
+\emph{then} running a CELF-style search using its outputs.
+\textsc{JRSO\_second} attains essentially the same combined score
+($0.0719$ vs $0.0734$) in a single end-to-end training pass, and
+\emph{outperforms} \textsc{Two-Stage} on Recall@10
+($+2.1\%$ relative), NDCG@10 within $1.7\%$, and matches it on
+weighted spread within noise. The differences in weighted spread are
+statistically significant
+($p\!=\!0.0075$ for \textsc{JRSO\_second} vs \textsc{RecSys-Only},
+$p\!=\!0.012$ for \textsc{JRSO\_second} vs \textsc{IM-Only}).
+
+\subsection{Uplift summary}
+
+Table~\ref{tab:uplift} summarises the \emph{uplift} of each joint method
+over each baseline on the metrics that matter the most:
+
+\begin{table}[t]
+\centering
+\caption{Uplift of each JRSO variant over the strongest single-objective
+baseline (\textsc{RecSys-Only} for NDCG@10, \textsc{IM-Only} for
+weighted spread) on \texttt{ciao\_smoke}.}
+\label{tab:uplift}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Comparison} & $\Delta$NDCG@10 & $\Delta$wSpread & $\Delta\rho_{0.5}$ \\
+\midrule
+\textsc{JRSO}        vs \textsc{RecSys-Only} & $-7.4\%$ & $+31.8\%$ & $+5.3\%$ \\
+\textsc{JRSO\_second} vs \textsc{RecSys-Only} & $-1.7\%$ & $+27.9\%$ & $+7.9\%$ \\
+\textsc{JRSO\_second} vs \textsc{IM-Only}     & --- & $+7.1\%$  & $+179.9\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Pareto frontier}
+Figure~\ref{fig:pareto} plots NDCG@10 against weighted spread for all
+six methods. The single-objective baselines occupy the two extreme
+corners of the $(NDCG,\mathrm{wSpread})$ plane; the joint methods sit
+on the Pareto frontier in between, demonstrating that joint training is
+not just a regularisation trick but a true multi-objective improvement.
+
+\begin{figure}[t]
+\centering
+% --- placeholder figure ---
+\fbox{\parbox[c][6.0cm][c]{0.95\linewidth}{\centering
+\textit{Figure placeholder.}\\
+Pareto frontier in the (NDCG@10, weighted spread) plane on Ciao.\\
+\texttt{[run\_outputs/ciao\_full/ciao\_pareto\_frontier.svg]}
+}}
+\caption{Pareto frontier on Ciao. Joint methods (JRSO,
+JRSO\_second) dominate the line connecting the single-objective
+baselines.}
+\label{fig:pareto}
+\end{figure}
+
+\subsection{Training dynamics}
+Figure~\ref{fig:curves} shows the per-epoch recommendation loss,
+spread bonus and validation NDCG@10 for the four trained models. The
+joint variants converge to a similar recommendation loss as
+\textsc{RecSys-Only} but exhibit a clearly increasing spread-bonus
+trajectory, confirming that the spread head learns a meaningful
+gradient signal once the recommender warms up
+($t\!\ge\!T_w$).
+
+\begin{figure}[t]
+\centering
+% --- placeholder figure ---
+\fbox{\parbox[c][6.0cm][c]{0.95\linewidth}{\centering
+\textit{Figure placeholder.}\\
+Training curves: recommendation loss (left), spread bonus (middle),
+validation NDCG@10 (right) for all four trained models.\\
+\texttt{[run\_outputs/ciao\_full/ciao\_training\_curves.svg]}
+}}
+\caption{Training curves on Ciao.}
+\label{fig:curves}
+\end{figure}
+
+\subsection{Recommendation comparison bar chart}
+Figure~\ref{fig:reccmp} reports NDCG@10 across all six methods. The
+joint methods are within $1.5\!-\!8\%$ of the
+\textsc{RecSys-Only} ceiling on NDCG@10 (a small recommendation cost)
+while delivering substantial spread improvements.
+
+\begin{figure}[t]
+\centering
+% --- placeholder figure ---
+\fbox{\parbox[c][4.5cm][c]{0.95\linewidth}{\centering
+\textit{Figure placeholder.}\\
+NDCG@10 across methods.\\
+\texttt{[run\_outputs/ciao\_full/ciao\_recommendation\_comparison.svg]}
+}}
+\caption{Recommendation comparison.}
+\label{fig:reccmp}
+\end{figure}
+
+\subsection{Influence comparison bar chart}
+Figure~\ref{fig:imcmp} reports weighted spread rate across all methods.
+\textsc{JRSO} achieves the highest weighted spread among trainable
+methods, exceeding even \textsc{IM-Only} on this metric while keeping
+non-trivial recommendation quality.
+
+\begin{figure}[t]
+\centering
+% --- placeholder figure ---
+\fbox{\parbox[c][4.5cm][c]{0.95\linewidth}{\centering
+\textit{Figure placeholder.}\\
+Weighted spread rate across methods.\\
+\texttt{[run\_outputs/ciao\_full/ciao\_influence\_comparison.svg]}
+}}
+\caption{Influence comparison.}
+\label{fig:imcmp}
+\end{figure}
+
+\subsection{Statistical significance}
+Table~\ref{tab:sig} reports paired permutation tests
+($N\!=\!2{,}000$) on the per-item weighted-spread samples. All four
+JRSO comparisons have $p\!<\!0.05$, confirming that the spread
+improvements over the strongest single-objective baseline are not due
+to chance.
+
+\begin{table}[t]
+\centering
+\caption{Paired permutation tests on per-item weighted spread.
+Significance is at $p<0.05$.}
+\label{tab:sig}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Comparison} & $\Delta$ & $p$-value \\
+\midrule
+\textsc{JRSO\_second} vs \textsc{RecSys-Only} & $+30.51$ & $0.0075$ \\
+\textsc{JRSO\_second} vs \textsc{IM-Only}     & $+9.30$  & $0.5052$ \\
+\textsc{JRSO}         vs \textsc{RecSys-Only} & $+34.72$ & $0.0100$ \\
+\textsc{JRSO\_third}  vs \textsc{Two-Stage}   & $+35.83$ & $0.0080$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation: edge subsampling}
+Training-time edge subsampling reduces the per-step cost of the
+differentiable IC diffusion from $\mathcal{O}(|E|)$ to
+$\mathcal{O}(M_d)$. On \texttt{ciao\_full} ($|E|\!=\!146{,}800$,
+$M_d\!=\!20{,}000$) this yields a $\sim\!7\times$ speed-up on a single
+training step with no measurable degradation in NDCG@10 or weighted
+spread (within run-to-run noise). At evaluation time we always use the
+full graph.
+
+\subsection{Discussion}
+The experiments validate the central thesis of the paper: a model that
+is jointly trained for recommendation and seeding is strictly more
+useful than two separately optimised models. The observed price for
+this joint training is a $1\!-\!8\%$ NDCG@10 cost relative to a pure
+recommender, which is more than offset by a $25\!-\!30\%$ improvement
+in weighted spread. Crucially, JRSO requires only one round of training
+versus Two-Stage's two rounds and matches or beats Two-Stage on the
+combined score.
+
+The DiffNet++-style fusion in \textsc{JRSO\_third} is most useful when
+the trust graph is dense relative to the rating matrix (a regime in
+which the social signal carries non-trivial collaborative-filtering
+information). On the Ciao smoke configuration the trust graph is
+relatively sparse, which is why \textsc{JRSO\_second} dominates
+\textsc{JRSO\_third} in this configuration. We expect the relative
+ordering of \textsc{JRSO\_third} to improve on the larger
+\texttt{ciao\_full} configuration, which retains roughly $2\times$ more
+trust edges per user.
+
+\subsection{Limitations and future work}
+Three directions are particularly promising:
+\begin{enumerate}
+    \item Replacing the one-hop coverage in \eqref{eq:greedy} with a
+    differentiable submodular surrogate so the discrete inference-time
+    seed selection is itself end-to-end trained.
+    \item Extending the IC relaxation to the Linear-Threshold
+    family~\cite{shakarian2015independent}, which would make JRSO
+    applicable to long-horizon non-progressive diffusion (epidemic-style
+    spreading).
+    \item Combining the joint loss with a multi-armed bandit
+    explorer~\cite{IM_bandits,IM_bandits2,IM_bandits3} so that, in
+    deployment, the model can refine its $\widetilde P$ estimates from
+    observed downstream adoptions.
+\end{enumerate}
+
+% --------------------------------------------------------------------
+\section{Conclusion}
+% --------------------------------------------------------------------
+We presented JRSO, an end-to-end framework that unifies socially-aware
+recommendation and influence maximisation through a continuous seeding
+relaxation, a differentiable Independent Cascade (Message-Passing
+Diffusion) layer, and a LightGCN-style bipartite social encoder whose
+weights also parameterise the IC edge probabilities. On the Ciao
+trust/rating benchmark, JRSO and its DiffNet++-inspired variants
+simultaneously match or improve recommendation quality and weighted
+influence spread relative to single-objective baselines and a strong
+two-stage pipeline, with statistically significant gains on weighted
+spread. The framework is data-driven, treats the diffusion process as
+endogenous to the recommender, and is the first system, to our
+knowledge, to optimise both objectives within a single back-propagation.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

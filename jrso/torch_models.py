@@ -163,11 +163,22 @@ class LightGCNEncoder(nn.Module):
         embeddings = self.all_embeddings()
         layer_outputs = [embeddings]
         current = embeddings
-        for _ in range(self.num_layers):
-            current = torch.sparse.mm(lightgcn_adj, current)
-            if self.dropout > 0.0 and self.training:
-                current = F.dropout(current, p=self.dropout)
-            layer_outputs.append(current)
+        # torch.sparse.mm on CUDA does not implement fp16 ("addmm_sparse_cuda"
+        # not implemented for 'Half'), so we always run the sparse propagation
+        # in float32 even when an outer autocast context is fp16/bf16.
+        out_dtype = current.dtype
+        sparse_dtype = lightgcn_adj.dtype
+        if sparse_dtype not in (torch.float32, torch.float64):
+            lightgcn_adj_fp = lightgcn_adj.to(torch.float32)
+        else:
+            lightgcn_adj_fp = lightgcn_adj
+        with torch.amp.autocast(device_type=current.device.type, enabled=False):
+            current_fp = current.to(torch.float32)
+            for _ in range(self.num_layers):
+                current_fp = torch.sparse.mm(lightgcn_adj_fp, current_fp)
+                if self.dropout > 0.0 and self.training:
+                    current_fp = F.dropout(current_fp, p=self.dropout)
+                layer_outputs.append(current_fp.to(out_dtype))
         stacked = torch.stack(layer_outputs, dim=0)
         averaged = stacked.mean(dim=0)
         user_repr = averaged[: self.num_users]
