@@ -8,13 +8,13 @@ from pathlib import Path
 class TorchDatasetConfig:
     """Sparse synthetic benchmark configuration for GPU-scale experiments."""
 
-    num_users: int = 10_000
-    num_items: int = 1_000
+    num_users: int = 8_000
+    num_items: int = 1_500
     latent_dim: int = 48
     num_communities: int = 20
     avg_intra_degree: int = 18
     avg_inter_degree: int = 4
-    interaction_density: float = 0.018
+    interaction_density: float = 0.020
     min_interactions_per_user: int = 8
     max_interactions_per_user: int = 30
     val_ratio: float = 0.10
@@ -60,24 +60,25 @@ class TorchDatasetConfig:
 class TorchTrainingConfig:
     """Training configuration for sparse torch models."""
 
-    hidden_dim: int = 128
-    num_layers: int = 4
-    dropout: float = 0.20
-    learning_rate: float = 2e-3
+    hidden_dim: int = 96
+    num_layers: int = 3
+    dropout: float = 0.10
+    learning_rate: float = 5e-3
     weight_decay: float = 1e-5
-    epochs: int = 60
-    steps_per_epoch: int = 20
+    epochs: int = 80
+    steps_per_epoch: int = 30
     batch_size: int = 4_096
-    negative_candidates: int = 24
+    negative_candidates: int = 32
     spread_items_per_step: int = 6
-    lambda_spread: float = 0.15
-    diffusion_steps: int = 5
+    lambda_spread: float = 0.10
+    diffusion_steps: int = 4
     gradient_clip_norm: float = 5.0
     eval_batch_size: int = 1_024
     amp: bool = True
     device: str = "auto"
     use_hard_negatives: bool = True
-    warmup_epochs: int = 8
+    warmup_epochs: int = 12
+    diffusion_edge_cap: int = 32_768
     seed: int = 321
 
     def replace(self, **changes: object) -> "TorchTrainingConfig":
@@ -107,92 +108,91 @@ class TorchExperimentConfig:
         if name == "gpu_smoke":
             recsys = TorchTrainingConfig(
                 hidden_dim=48,
-                num_layers=3,
+                num_layers=2,
                 dropout=0.10,
-                learning_rate=3e-3,
-                epochs=2,
-                steps_per_epoch=3,
+                learning_rate=5e-3,
+                epochs=4,
+                steps_per_epoch=4,
                 batch_size=192,
-                negative_candidates=12,
+                negative_candidates=16,
                 spread_items_per_step=3,
-                lambda_spread=0.10,
+                lambda_spread=0.05,
                 diffusion_steps=3,
                 eval_batch_size=128,
                 amp=False,
+                use_hard_negatives=True,
+                warmup_epochs=2,
                 seed=401,
             )
-            jrso = recsys.replace(lambda_spread=0.18, seed=402)
+            jrso = recsys.replace(lambda_spread=0.15, seed=402)
             jrso_second = recsys.replace(
                 hidden_dim=64,
-                num_layers=4,
-                dropout=0.15,
+                num_layers=3,
+                dropout=0.10,
                 negative_candidates=20,
-                lambda_spread=0.24,
-                use_hard_negatives=True,
-                warmup_epochs=1,
+                lambda_spread=0.18,
+                spread_items_per_step=3,
+                warmup_epochs=2,
                 seed=403,
             )
             jrso_third = recsys.replace(
-                hidden_dim=72,
-                num_layers=4,
+                hidden_dim=64,
+                num_layers=3,
                 dropout=0.10,
-                learning_rate=2.5e-3,
+                learning_rate=5e-3,
                 negative_candidates=24,
-                spread_items_per_step=4,
-                lambda_spread=0.28,
-                use_hard_negatives=True,
-                warmup_epochs=1,
+                spread_items_per_step=3,
+                lambda_spread=0.22,
+                warmup_epochs=2,
                 seed=404,
             )
         else:
             recsys = TorchTrainingConfig(
-                hidden_dim=160,
-                num_layers=5,
-                dropout=0.18,
-                learning_rate=1.6e-3,
+                hidden_dim=128,
+                num_layers=3,
+                dropout=0.10,
+                learning_rate=4e-3,
                 weight_decay=1e-5,
-                epochs=90,
-                steps_per_epoch=28,
+                epochs=120,
+                steps_per_epoch=40,
                 batch_size=4096,
-                negative_candidates=32,
+                negative_candidates=64,
                 spread_items_per_step=6,
-                lambda_spread=0.15,
-                diffusion_steps=5,
+                lambda_spread=0.10,
+                diffusion_steps=4,
                 gradient_clip_norm=5.0,
                 eval_batch_size=1024,
                 amp=True,
                 use_hard_negatives=True,
-                warmup_epochs=12,
+                warmup_epochs=20,
                 seed=701,
             )
             jrso = recsys.replace(
-                learning_rate=1.4e-3,
-                negative_candidates=36,
-                spread_items_per_step=8,
-                lambda_spread=0.24,
-                warmup_epochs=16,
+                lambda_spread=0.15,
+                spread_items_per_step=6,
+                warmup_epochs=24,
                 seed=702,
             )
             jrso_second = recsys.replace(
-                hidden_dim=192,
-                num_layers=6,
-                dropout=0.22,
-                learning_rate=1.2e-3,
-                negative_candidates=48,
-                spread_items_per_step=10,
-                lambda_spread=0.32,
-                warmup_epochs=18,
+                hidden_dim=160,
+                num_layers=4,
+                dropout=0.15,
+                learning_rate=3e-3,
+                negative_candidates=64,
+                spread_items_per_step=8,
+                lambda_spread=0.20,
+                warmup_epochs=28,
                 seed=703,
             )
             jrso_third = recsys.replace(
-                hidden_dim=224,
-                num_layers=5,
-                dropout=0.20,
-                learning_rate=1.1e-3,
-                negative_candidates=48,
-                spread_items_per_step=10,
-                lambda_spread=0.34,
-                warmup_epochs=18,
+                hidden_dim=160,
+                num_layers=4,
+                dropout=0.15,
+                learning_rate=3e-3,
+                negative_candidates=64,
+                spread_items_per_step=8,
+                lambda_spread=0.25,
+                warmup_epochs=28,
                 seed=704,
             )
         return cls(

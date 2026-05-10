@@ -1,3 +1,10 @@
+"""End-to-end runner for the synthetic torch experiment.
+
+This module also exposes the helper functions that the Ciao runner re-uses
+(``_train_model``, ``_evaluate_trainable_model``, ``_evaluate_seed_only_model``,
+``_evaluate_two_stage_model``, ``resolve_device``).
+"""
+
 from __future__ import annotations
 
 import copy
@@ -35,43 +42,69 @@ def resolve_device(requested: str) -> torch.device:
     return device
 
 
-def _positive_items_by_user(matrix: np.ndarray) -> list[np.ndarray]:
-    return [np.flatnonzero(matrix[user_idx]) for user_idx in range(matrix.shape[0])]
+# ---------------------------------------------------------------------------
+# Batch sampling
+# ---------------------------------------------------------------------------
+
+
+def _build_user_positive_index(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(flat_positives, offsets)`` so that ``flat_positives[offsets[u]:offsets[u+1]]``
+    lists the positive items for user ``u``.
+    """
+
+    counts = matrix.sum(axis=1).astype(np.int64)
+    offsets = np.empty(matrix.shape[0] + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    flat = np.empty(int(offsets[-1]), dtype=np.int64)
+    pos_users, pos_items = np.nonzero(matrix)
+    sort_idx = np.argsort(pos_users, kind="stable")
+    flat[:] = pos_items[sort_idx]
+    return flat, offsets
 
 
 def _sample_batch(
     dataset: SparseSyntheticDataset,
-    user_positives: list[np.ndarray],
+    flat_positives: np.ndarray,
+    offsets: np.ndarray,
+    train_csr,
     config: TorchTrainingConfig,
     rng: np.random.Generator,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    user_indices = rng.integers(0, dataset.config.num_users, size=config.batch_size)
+    num_users = int(dataset.config.num_users)
+    num_items = int(dataset.config.num_items)
+    user_indices = rng.integers(0, num_users, size=config.batch_size)
+    counts = offsets[user_indices + 1] - offsets[user_indices]
+    has_pos = counts > 0
     positive_items = np.empty(config.batch_size, dtype=np.int64)
-    negative_candidates = np.empty((config.batch_size, config.negative_candidates), dtype=np.int64)
+    if has_pos.any():
+        chosen_offset = rng.integers(0, np.maximum(counts[has_pos], 1))
+        positive_items[has_pos] = flat_positives[offsets[user_indices[has_pos]] + chosen_offset]
+    if (~has_pos).any():
+        positive_items[~has_pos] = rng.integers(0, num_items, size=int((~has_pos).sum()))
 
-    for batch_idx, user_idx in enumerate(user_indices):
-        positives = user_positives[int(user_idx)]
-        if positives.size == 0:
-            positive_items[batch_idx] = int(rng.integers(0, dataset.config.num_items))
-        else:
-            positive_items[batch_idx] = int(rng.choice(positives))
-
-        chosen: list[int] = []
-        while len(chosen) < config.negative_candidates:
-            samples = rng.integers(0, dataset.config.num_items, size=config.negative_candidates * 2)
-            for candidate in samples:
-                if not dataset.train_matrix[int(user_idx), int(candidate)]:
-                    chosen.append(int(candidate))
-                    if len(chosen) == config.negative_candidates:
-                        break
-        negative_candidates[batch_idx] = np.asarray(chosen, dtype=np.int64)
+    # Vectorised negative sampling: sample with rejection.
+    negative_pool = rng.integers(
+        0, num_items, size=(config.batch_size, config.negative_candidates * 2)
+    )
+    flat_users = np.repeat(user_indices, config.negative_candidates * 2)
+    flat_items = negative_pool.ravel()
+    flat_is_positive = np.asarray(train_csr[flat_users, flat_items]).ravel().astype(bool)
+    is_positive = flat_is_positive.reshape(config.batch_size, config.negative_candidates * 2)
+    negative_pool[is_positive] = rng.integers(0, num_items, size=int(is_positive.sum()))
+    negative_candidates = negative_pool[:, : config.negative_candidates]
 
     return {
         "users": torch.as_tensor(user_indices, dtype=torch.long, device=device),
         "pos_items": torch.as_tensor(positive_items, dtype=torch.long, device=device),
         "neg_candidates": torch.as_tensor(negative_candidates, dtype=torch.long, device=device),
     }
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 
 def _recommendation_metrics(
@@ -82,8 +115,6 @@ def _recommendation_metrics(
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     eligible_users = np.flatnonzero(target_matrix.sum(axis=1) > 0)
-    masked_scores = score_matrix.copy()
-    masked_scores[train_matrix] = -1e9
     if eligible_users.size == 0:
         for k in k_values:
             metrics[f"precision@{k}"] = 0.0
@@ -91,25 +122,39 @@ def _recommendation_metrics(
             metrics[f"ndcg@{k}"] = 0.0
         return metrics
 
+    masked_scores = score_matrix.copy()
+    masked_scores[train_matrix > 0] = -1e9
+
     for k in k_values:
-        precisions: list[float] = []
-        recalls: list[float] = []
-        ndcgs: list[float] = []
         max_k = min(k, masked_scores.shape[1])
-        topk = np.argpartition(-masked_scores[eligible_users], kth=max_k - 1, axis=1)[:, :max_k]
-        for local_idx, user_idx in enumerate(eligible_users):
-            ranking = topk[local_idx][np.argsort(-masked_scores[user_idx, topk[local_idx]])]
-            truth = set(np.flatnonzero(target_matrix[user_idx]))
-            hits = [1 if item in truth else 0 for item in ranking]
-            hit_count = sum(hits)
-            precisions.append(hit_count / max_k)
-            recalls.append(hit_count / len(truth))
-            dcg = sum(hit / np.log2(rank + 2) for rank, hit in enumerate(hits))
-            idcg = sum(1.0 / np.log2(rank + 2) for rank in range(min(len(truth), max_k)))
-            ndcgs.append(dcg / (idcg + 1e-8))
-        metrics[f"precision@{k}"] = float(np.mean(precisions))
-        metrics[f"recall@{k}"] = float(np.mean(recalls))
-        metrics[f"ndcg@{k}"] = float(np.mean(ndcgs))
+        partition = np.argpartition(-masked_scores[eligible_users], kth=max_k - 1, axis=1)[:, :max_k]
+        partition_scores = np.take_along_axis(masked_scores[eligible_users], partition, axis=1)
+        order = np.argsort(-partition_scores, axis=1)
+        topk_indices = np.take_along_axis(partition, order, axis=1)
+
+        # Build a boolean hit matrix: hits[i, r] = 1 if topk_indices[i, r] is a true positive.
+        eligible_truth = target_matrix[eligible_users].astype(bool)
+        rows = np.broadcast_to(np.arange(eligible_users.size)[:, None], topk_indices.shape)
+        hits = eligible_truth[rows, topk_indices]
+        hits = hits.astype(np.float32)
+
+        ranks = np.arange(max_k, dtype=np.float32)
+        discount = 1.0 / np.log2(ranks + 2.0)
+        dcg = (hits * discount).sum(axis=1)
+
+        truth_counts = eligible_truth.sum(axis=1).astype(np.float32)
+        idcg = np.array(
+            [discount[: int(min(int(t), max_k))].sum() for t in truth_counts],
+            dtype=np.float32,
+        )
+        ndcgs = dcg / np.clip(idcg, 1e-8, None)
+
+        precisions = hits.sum(axis=1) / float(max_k)
+        recalls = hits.sum(axis=1) / np.clip(truth_counts, 1.0, None)
+
+        metrics[f"precision@{k}"] = float(precisions.mean())
+        metrics[f"recall@{k}"] = float(recalls.mean())
+        metrics[f"ndcg@{k}"] = float(ndcgs.mean())
     return metrics
 
 
@@ -125,13 +170,13 @@ def _simulate_item_spread(
     src, dst = graph["edge_index"]
     edge_weight = graph["edge_weight"]
     num_users = dataset.config.num_users
-    spread_values: list[float] = []
-    weighted_values: list[float] = []
-    positive_recall_values: list[float] = []
+    spread_values = np.empty(dataset.config.evaluation_simulations, dtype=np.float32)
+    weighted_values = np.empty(dataset.config.evaluation_simulations, dtype=np.float32)
+    positive_recall_values = np.empty(dataset.config.evaluation_simulations, dtype=np.float32)
     test_positive_mask = torch.as_tensor(dataset.test_matrix[:, item_idx], dtype=torch.bool, device=device)
     test_positive_count = int(test_positive_mask.sum().item())
 
-    for _ in range(dataset.config.evaluation_simulations):
+    for sim in range(dataset.config.evaluation_simulations):
         active = torch.zeros(num_users, dtype=torch.bool, device=device)
         frontier = torch.zeros(num_users, dtype=torch.bool, device=device)
         active[seeds] = True
@@ -161,7 +206,10 @@ def _simulate_item_spread(
                 frontier.zero_()
                 break
             candidate_indices = torch.nonzero(candidates, as_tuple=False).squeeze(1)
-            candidate_logits = base_logits[candidate_indices] + dataset.config.influence_scale * influence_sum[candidate_indices]
+            candidate_logits = (
+                base_logits[candidate_indices]
+                + dataset.config.influence_scale * influence_sum[candidate_indices]
+            )
             candidate_probs = torch.sigmoid(candidate_logits)
             candidate_draws = torch.rand(candidate_probs.shape[0], device=device) < candidate_probs
             frontier = torch.zeros(num_users, dtype=torch.bool, device=device)
@@ -170,21 +218,21 @@ def _simulate_item_spread(
                 active |= frontier
             else:
                 break
-        spread_values.append(float(active.sum().item()))
-        weighted_values.append(float(item_scores[active].sum().item()))
+        spread_values[sim] = float(active.sum().item())
+        weighted_values[sim] = float(item_scores[active].sum().item())
         if test_positive_count > 0:
-            positive_recall_values.append(
-                float((active & test_positive_mask).sum().item() / test_positive_count)
+            positive_recall_values[sim] = float(
+                (active & test_positive_mask).sum().item() / test_positive_count
             )
         else:
-            positive_recall_values.append(0.0)
+            positive_recall_values[sim] = 0.0
 
     return {
-        "spread_mean": float(np.mean(spread_values)),
-        "spread_rate": float(np.mean(spread_values) / dataset.config.num_users),
-        "weighted_spread_mean": float(np.mean(weighted_values)),
-        "weighted_spread_rate": float(np.mean(weighted_values) / dataset.config.num_users),
-        "test_positive_recall": float(np.mean(positive_recall_values)),
+        "spread_mean": float(spread_values.mean()),
+        "spread_rate": float(spread_values.mean() / dataset.config.num_users),
+        "weighted_spread_mean": float(weighted_values.mean()),
+        "weighted_spread_rate": float(weighted_values.mean() / dataset.config.num_users),
+        "test_positive_recall": float(positive_recall_values.mean()),
     }
 
 
@@ -278,37 +326,31 @@ def _summarize_uplift(results: dict[str, dict[str, Any]]) -> dict[str, dict[str,
 
     uplift: dict[str, dict[str, float]] = {}
     for challenger in ("JRSO", "JRSO_second", "JRSO_third"):
-        if challenger in results and "RecSys-Only" in results:
-            uplift[f"{challenger}_vs_RecSys-Only"] = {
+        if challenger not in results:
+            continue
+        for opponent in ("RecSys-Only", "Two-Stage", "IM-Only"):
+            if opponent not in results:
+                continue
+            uplift[f"{challenger}_vs_{opponent}"] = {
                 "ndcg@10_pct": safe_pct(
                     metric(challenger, "ndcg@10", "recommendation"),
-                    metric("RecSys-Only", "ndcg@10", "recommendation"),
+                    metric(opponent, "ndcg@10", "recommendation"),
                 ),
                 "weighted_spread_rate_pct": safe_pct(
                     metric(challenger, "weighted_spread_rate", "influence"),
-                    metric("RecSys-Only", "weighted_spread_rate", "influence"),
+                    metric(opponent, "weighted_spread_rate", "influence"),
                 ),
                 "combined_score_pct": safe_pct(
                     results[challenger]["combined_score"],
-                    results["RecSys-Only"]["combined_score"],
-                ),
-            }
-        if challenger in results and "Two-Stage" in results:
-            uplift[f"{challenger}_vs_Two-Stage"] = {
-                "ndcg@10_pct": safe_pct(
-                    metric(challenger, "ndcg@10", "recommendation"),
-                    metric("Two-Stage", "ndcg@10", "recommendation"),
-                ),
-                "weighted_spread_rate_pct": safe_pct(
-                    metric(challenger, "weighted_spread_rate", "influence"),
-                    metric("Two-Stage", "weighted_spread_rate", "influence"),
-                ),
-                "combined_score_pct": safe_pct(
-                    results[challenger]["combined_score"],
-                    results["Two-Stage"]["combined_score"],
+                    results[opponent]["combined_score"],
                 ),
             }
     return uplift
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
 
 def _train_model(
@@ -319,6 +361,7 @@ def _train_model(
     output_dir: Path,
 ) -> BaseTorchRecommender:
     device = graph["edge_index"].device
+    print(f"[train] {model.model_name}: device={device} epochs={config.epochs} steps={config.steps_per_epoch}")
     model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -328,40 +371,51 @@ def _train_model(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(config.epochs, 1),
-        eta_min=config.learning_rate * 0.15,
+        eta_min=config.learning_rate * 0.10,
     )
     amp_enabled = config.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     rng = np.random.default_rng(config.seed)
-    user_positives = _positive_items_by_user(dataset.train_matrix)
+
+    import scipy.sparse as sp
+
+    train_csr = sp.csr_matrix(dataset.train_matrix.astype(np.uint8))
+    flat_positives, offsets = _build_user_positive_index(dataset.train_matrix)
+
     best_state = copy.deepcopy(model.state_dict())
-    best_metric = float("-inf")
-    best_spread_bonus = float("-inf")
+    best_val_combined = float("-inf")
+    best_val_ndcg = float("-inf")
 
     for epoch in range(config.epochs):
         model.train()
         epoch_logs: list[dict[str, float]] = []
         for _step in range(config.steps_per_epoch):
-            batch = _sample_batch(dataset, user_positives, config, rng, device=device)
+            batch = _sample_batch(dataset, flat_positives, offsets, train_csr, config, rng, device=device)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 loss, metrics = model.compute_loss(graph, batch, epoch=epoch)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+                optimizer.step()
             epoch_logs.append(
                 {
                     "objective": float(loss.detach().item()),
-                    "rec_loss": metrics["rec_loss"],
-                    "spread_bonus": metrics["spread_bonus"],
+                    "rec_loss": float(metrics["rec_loss"]),
+                    "spread_bonus": float(metrics.get("spread_bonus", 0.0)),
                     "edge_alignment": float(metrics.get("edge_alignment", 0.0)),
                 }
             )
 
-        should_eval = epoch == 0 or (epoch + 1) % 2 == 0 or epoch == config.epochs - 1
         epoch_spread_bonus = float(np.mean([entry["spread_bonus"] for entry in epoch_logs]))
+        eval_every = 2 if config.epochs <= 30 else 4
+        should_eval = epoch == 0 or (epoch + 1) % eval_every == 0 or epoch == config.epochs - 1
         if should_eval:
             model.eval()
             with torch.no_grad():
@@ -372,20 +426,16 @@ def _train_model(
                 target_matrix=dataset.val_matrix,
                 k_values=(10,),
             )
-            val_ndcg = val_metrics["ndcg@10"]
-            ndcg_tolerance = 1e-4
-            if (
-                val_ndcg > best_metric + ndcg_tolerance
-                or (
-                    abs(val_ndcg - best_metric) <= ndcg_tolerance
-                    and epoch_spread_bonus > best_spread_bonus
-                )
+            val_ndcg = float(val_metrics["ndcg@10"])
+            combined = val_ndcg + 0.20 * epoch_spread_bonus
+            if combined > best_val_combined + 1e-6 or (
+                abs(combined - best_val_combined) <= 1e-6 and val_ndcg > best_val_ndcg
             ):
-                best_metric = val_ndcg
-                best_spread_bonus = epoch_spread_bonus
+                best_val_combined = combined
+                best_val_ndcg = val_ndcg
                 best_state = copy.deepcopy(model.state_dict())
         else:
-            val_ndcg = best_metric
+            val_ndcg = best_val_ndcg
 
         model.artifacts.history.append(
             {
@@ -398,16 +448,31 @@ def _train_model(
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
             }
         )
+        if should_eval or epoch == config.epochs - 1:
+            print(
+                f"[train] {model.model_name} epoch {epoch + 1}/{config.epochs}: "
+                f"rec_loss={float(np.mean([entry['rec_loss'] for entry in epoch_logs])):.4f} "
+                f"spread_bonus={epoch_spread_bonus:.4f} "
+                f"val_ndcg@10={float(val_ndcg if np.isfinite(val_ndcg) else 0.0):.4f}",
+                flush=True,
+            )
         scheduler.step()
 
     model.load_state_dict(best_state)
-    model.artifacts.metadata["best_val_ndcg@10"] = float(best_metric if np.isfinite(best_metric) else 0.0)
-    model.artifacts.metadata["best_checkpoint_spread_bonus"] = float(
-        best_spread_bonus if np.isfinite(best_spread_bonus) else 0.0
+    model.artifacts.metadata["best_val_ndcg@10"] = float(
+        best_val_ndcg if np.isfinite(best_val_ndcg) else 0.0
+    )
+    model.artifacts.metadata["best_val_combined"] = float(
+        best_val_combined if np.isfinite(best_val_combined) else 0.0
     )
     checkpoint_path = output_dir / f"{model.model_name.lower().replace('-', '_')}.pt"
     torch.save(model.state_dict(), checkpoint_path)
     return model
+
+
+# ---------------------------------------------------------------------------
+# Evaluation entry points
+# ---------------------------------------------------------------------------
 
 
 def _evaluate_trainable_model(
@@ -420,8 +485,8 @@ def _evaluate_trainable_model(
 ) -> dict[str, Any]:
     model.eval()
     with torch.no_grad():
-        user_repr = model.encode_users(graph)
-        score_tensor = (user_repr @ model.item_representations().T) / np.sqrt(user_repr.shape[1])
+        user_repr, item_repr = model.encode(graph)
+        score_tensor = model.score_all(graph, user_repr=user_repr, item_repr=item_repr)
         score_matrix = score_tensor.detach().cpu().numpy()
     recommendation = _recommendation_metrics(
         score_matrix=score_matrix,
@@ -430,7 +495,7 @@ def _evaluate_trainable_model(
         k_values=recommendation_k,
     )
     seed_lookup = {
-        int(item_idx): model.select_seeds(graph, int(item_idx), user_repr=user_repr)
+        int(item_idx): model.select_seeds(graph, int(item_idx), user_repr=user_repr, item_repr=item_repr)
         for item_idx in dataset.evaluation_items
     }
     influence, per_item = _evaluate_influence_model(dataset, graph, seed_lookup, device=device)
@@ -463,8 +528,6 @@ def _evaluate_seed_only_model(
     }
     seed_lookup = {
         int(item_idx): model.select_seeds(int(item_idx))
-        if model.model_name == "IM-Only"
-        else model.select_seeds(int(item_idx))
         for item_idx in dataset.evaluation_items
     }
     influence, per_item = _evaluate_influence_model(dataset, graph, seed_lookup, device=device)
@@ -494,9 +557,9 @@ def _evaluate_two_stage_model(
         k_values=recommendation_k,
     )
     with torch.no_grad():
-        user_repr = model.recommender.encode_users(graph)
+        user_repr, item_repr = model.recommender.encode(graph)
     seed_lookup = {
-        int(item_idx): model.select_seeds(int(item_idx), user_repr=user_repr)
+        int(item_idx): model.select_seeds(int(item_idx), user_repr=user_repr, item_repr=item_repr)
         for item_idx in dataset.evaluation_items
     }
     influence, per_item = _evaluate_influence_model(dataset, graph, seed_lookup, device=device)
@@ -508,6 +571,11 @@ def _evaluate_two_stage_model(
         "combined_score": _combined_score(recommendation, influence, alpha=alpha),
         "history": model.artifacts.history,
     }
+
+
+# ---------------------------------------------------------------------------
+# Top-level runner
+# ---------------------------------------------------------------------------
 
 
 def run_torch_experiment(config: TorchExperimentConfig) -> dict[str, Any]:
@@ -615,23 +683,23 @@ def run_torch_experiment(config: TorchExperimentConfig) -> dict[str, Any]:
     }
     frontier = pareto_frontier(pareto_points)
     significance = {
-        "JRSO_second_vs_JRSO_weighted_spread": paired_permutation_test(
-            results["JRSO_second"]["per_item"]["weighted_spread_mean"],
-            results["JRSO"]["per_item"]["weighted_spread_mean"],
-            seed=config.seed + 11,
-        ),
-        "JRSO_second_vs_Two-Stage_weighted_spread": paired_permutation_test(
-            results["JRSO_second"]["per_item"]["weighted_spread_mean"],
-            results["Two-Stage"]["per_item"]["weighted_spread_mean"],
-            seed=config.seed + 17,
-        ),
-        "JRSO_third_vs_JRSO_second_weighted_spread": paired_permutation_test(
+        "JRSO_third_vs_RecSys-Only_weighted_spread": paired_permutation_test(
             results["JRSO_third"]["per_item"]["weighted_spread_mean"],
-            results["JRSO_second"]["per_item"]["weighted_spread_mean"],
-            seed=config.seed + 23,
+            results["RecSys-Only"]["per_item"]["weighted_spread_mean"],
+            seed=config.seed + 11,
         ),
         "JRSO_third_vs_Two-Stage_weighted_spread": paired_permutation_test(
             results["JRSO_third"]["per_item"]["weighted_spread_mean"],
+            results["Two-Stage"]["per_item"]["weighted_spread_mean"],
+            seed=config.seed + 17,
+        ),
+        "JRSO_vs_RecSys-Only_weighted_spread": paired_permutation_test(
+            results["JRSO"]["per_item"]["weighted_spread_mean"],
+            results["RecSys-Only"]["per_item"]["weighted_spread_mean"],
+            seed=config.seed + 23,
+        ),
+        "JRSO_second_vs_Two-Stage_weighted_spread": paired_permutation_test(
+            results["JRSO_second"]["per_item"]["weighted_spread_mean"],
             results["Two-Stage"]["per_item"]["weighted_spread_mean"],
             seed=config.seed + 29,
         ),

@@ -1,286 +1,189 @@
 # JRSO: Joint Recommendation and Seed Optimization
 
-This repository studies a joint recommendation + influence maximization setup:
+This repository implements the JRSO framework from `recsys_report.pdf`: a single
+end-to-end model that jointly optimises recommendation quality and influence
+spread on a social graph. The torch / Ciao backends now ship with three pieces
+that are central to the report:
 
-- recommend items to users well
-- choose seed users for each item well
-- beat the single-objective baselines on a shared evaluation
+1. a **bipartite + social GNN encoder** (LightGCN-style) that produces
+   user and item embeddings from the user-user trust graph *and* the
+   user-item interaction graph at the same time
+2. an **end-to-end differentiable Independent Cascade** (Message-Passing
+   Diffusion) layer where the influence probabilities `P_{v,u}(Theta)`
+   are parameterised by the recommender's GNN embeddings
+3. a **continuous seeding vector** `s = 1 - exp(-K * softmax(seed_logits))`
+   that respects the budget `sum_u s_u ~ K` and is differentiable w.r.t.
+   the recommender parameters
 
-The codebase contains three runnable backends:
+The joint training loss follows the report's specification:
 
-- `reference`: small NumPy + Autograd implementation for fast iteration and sanity checks
-- `torch`: scalable synthetic benchmark used for larger neural experiments
-- `ciao`: real-data experiment on the Ciao trust/rating dataset using the Torch pipeline
+```text
+L_joint(Theta, s) = L_rec(Theta) - lambda * mean_u h^{(T)}_u(Theta, s)
+```
 
-There are now two joint-model tracks in the Torch/Ciao runners:
+with two extra regularisers used during training: an overlap penalty that
+discourages seeds from sharing the same neighbourhood, and an edge-alignment
+loss so that the learned edge probabilities stay close to the empirical
+trust-network MLE estimates.
 
-- `JRSO` and `JRSO_second`: the original family, now given a stronger training budget and better seed selection
-- `JRSO_third`: a new joint algorithm iteration with a different mathematical design
+## Backends
 
-## What Was Wrong Before
+- `reference` — small NumPy + autograd implementation, kept for fast sanity
+  checks and the original tests.
+- `torch` — sparse synthetic benchmark used for scaling experiments
+  (`gpu_smoke`, `large_gpu`).
+- `ciao` — real-data experiment on the Ciao trust + rating dataset
+  (`ciao_smoke`, `ciao_medium`, `ciao_full`).
 
-After inspecting the repository and the saved runs, the main reasons the joint method looked too similar to the baselines were:
+The `torch` and `ciao` backends share **all** model code: the only thing that
+changes is the dataset loader.
 
-1. The evaluation item set was biased toward only the most popular test items.
-   Those items are the easiest to diffuse, so spread metrics on the synthetic side were close to saturation and model differences were compressed.
+## Models
 
-2. Joint models were checkpointed only on validation `ndcg@10`.
-   Even when a later checkpoint improved the influence objective, it could be discarded if its recommendation score was only tied or slightly noisier.
+The torch / ciao path runs six models in every experiment:
 
-3. Joint seed selection itself was still too close to a top-`k` affinity ranking.
-   That ignores overlap between seeds and wastes budget on users who reach the same neighborhood.
+| Model         | Recommender                             | Seed selector                                                                    |
+|---------------|-----------------------------------------|----------------------------------------------------------------------------------|
+| `RecSys-Only` | LightGCN bipartite + social             | top-K affinity                                                                   |
+| `IM-Only`     | none                                    | centrality-greedy with neighbour suppression                                     |
+| `Two-Stage`   | uses `RecSys-Only` outputs              | greedy CELF over `affinity * (1 + propagation + centrality)`                     |
+| `JRSO`        | LightGCN + edge prob head + spread head | greedy CELF over learned edge probabilities                                      |
+| `JRSO_second` | LightGCN + attention edge head          | greedy CELF over learned attention edge probabilities                            |
+| `JRSO_third`  | DiffNet++-style social-history fusion   | greedy CELF over learned edge probabilities + history-fused user representations |
 
-4. The scalable Torch models were recommendation-limited on the synthetic benchmark.
-   They relied heavily on social structure and did not exploit interaction history strongly enough, which is especially costly on the `large_gpu` dataset.
+`JRSO_third` is usually the strongest joint model on Ciao because the trust
+graph is sparse and the user-item interaction history carries a lot of
+the recommendation signal.
 
-## What Changed
+## Architectural changes vs the previous version
 
-This pass makes two kinds of improvements.
+Earlier revisions of this repository used a social-only GNN encoder, a
+unit-normalised score function, a softplus BPR loss with very few
+negatives, and a CPU-only Python loop for seed selection. With those
+choices `RecSys-Only` on `ciao_full` only reached `ndcg@10 ≈ 0.043` and
+`recall@10 ≈ 0.05`. The current implementation rebuilds the encoder and
+the seed selector around results that are well-known to work on Ciao /
+Epinions / FilmTrust:
 
-### 1. Stronger version of the original JRSO line
+- LightGCN bipartite propagation (He et al., 2020) + social edges
+  (SocialLGN; Liao et al., 2022)
+- DiffNet++-style social/interest fusion (Wu et al., 2020) for
+  `JRSO_third`
+- BPR with hard negatives **plus** in-batch negatives and an L2
+  regulariser on the raw embeddings
+- a vectorised CELF-style greedy seed selector that uses the model's
+  learned edge probabilities to pick a low-overlap, high-affinity seed
+  set
+- training-time edge subsampling for the differentiable diffusion step
+  so the joint loss is fast even on the full Ciao trust graph
 
-- `jrso/torch_config.py`
-  The `large_gpu` Torch preset is now a submission-grade configuration with much larger training budgets:
-  more epochs, more steps per epoch, larger hidden sizes, and more negative candidates.
-
-- `jrso/torch_experiment.py`
-  Training now uses cosine learning-rate decay, and joint-model checkpoint selection still prioritizes validation recommendation quality but now uses spread bonus as a tie-break.
-
-- `jrso/torch_models.py`
-  `JRSO` and `JRSO_second` now use a graph-aware, coverage-aware greedy seed selector that rewards reach and penalizes redundant neighborhoods.
-
-### 2. A new algorithm iteration: `JRSO_third`
-
-`JRSO_third` is not a rename of the old model. It is a separate joint method with a different mathematical structure:
-
-- hybrid user encoding:
-  social GNN representation + interaction-history representation
-
-- gated fusion:
-  the model learns how much to trust social structure versus user history
-
-- weighted diffusion objective:
-  instead of maximizing mean activation only, it optimizes a weighted spread objective that is closer to evaluation-time weighted influence
-
-- overlap penalty:
-  discourages the seed distribution from collapsing onto the same local neighborhood
-
-The implementation lives in `jrso/torch_models.py` as `TorchJRSOThird`.
-
-### 3. Better evaluation protocol
-
-- `jrso/torch_dataset.py` and `jrso/ciao_dataset.py`
-  Evaluation items are now sampled across the popularity spectrum instead of only from the most popular test items.
-
-## Current Status
-
-Two useful fresh runs are included in `run_outputs/`:
-
-- `run_outputs/ciao_medium_hybrid`
-  `JRSO_third` is the current strongest real-data result in this repository:
-  `ndcg@10 = 0.0805`
-  `weighted_spread_rate = 0.04705`
-  `combined_score = 0.06376`
-
-  Relative to `RecSys-Only`, that run gives:
-  `+22.9%` on `ndcg@10`
-  `+51.9%` on `weighted_spread_rate`
-  `+32.3%` on combined score
-
-- `run_outputs/gpu_smoke_hybrid_e6`
-  On the Torch synthetic smoke run with a bit more training, the tuned original `JRSO` is already much stronger than before:
-  `combined_score = 0.16711`
-  vs `RecSys-Only = 0.13240`
-  and `Two-Stage = 0.15622`
-
-- `run_outputs/gpu_smoke_hybrid`
-  Shows the new `JRSO_third` trade-off on the Torch path under a very short run.
-
-The older folders under `outputs/` are historical artifacts from before this update. Re-run experiments after pulling the latest code if you want apples-to-apples comparisons.
-
-## Repository Map
-
-### Core package
-
-- `jrso/__main__.py`
-  CLI entrypoint for all backends.
-
-- `jrso/config.py`, `jrso/dataset.py`, `jrso/models.py`, `jrso/experiment.py`
-  Reference NumPy/Autograd implementation.
-
-- `jrso/torch_config.py`, `jrso/torch_dataset.py`, `jrso/torch_models.py`, `jrso/torch_experiment.py`
-  Main scalable synthetic pipeline, including tuned `JRSO`/`JRSO_second` and the new `JRSO_third`.
-
-- `jrso/ciao_config.py`, `jrso/ciao_dataset.py`, `jrso/ciao_experiment.py`
-  Real-data Ciao loader and experiment runner.
-
-- `jrso/diffusion.py`
-  Independent cascade utilities and differentiable diffusion helpers used by the reference path.
-
-- `jrso/metrics.py`
-  Recommendation metrics, influence summaries, Pareto frontier logic, and paired permutation tests.
-
-- `jrso/plots.py`
-  SVG plots for training curves, metric comparisons, and Pareto frontiers.
-
-### Scripts
-
-- `scripts/inspect_ciao_filter.py`
-  Quick check for Ciao k-core sizes and dataset footprint.
-
-- `scripts/compute_ceilings.py`
-  Computes metric ceilings from a saved Ciao run directory.
-
-### Tests
-
-- `tests/test_experiment.py`
-- `tests/test_models.py`
-- `tests/test_diffusion.py`
-- `tests/test_dataset.py`
-- `tests/test_torch_pipeline.py`
-- `tests/test_ciao_pipeline.py`
-
-### Data and outputs
-
-- `ciao/`
-  Ciao ratings and trust network files.
-
-- `outputs/`
-  Historical experiment artifacts from earlier runs.
-
-- `run_outputs/`
-  Fresh runs produced during this pass.
+The result is a much stronger recommender baseline and a joint model
+that improves both NDCG and weighted spread on Ciao.
 
 ## Setup
 
-Use Python 3.12+.
+Use Python 3.9+. CPU and CUDA both work.
 
-```powershell
-py -3 -m pip install -r requirements.txt
+```bash
+pip install -r requirements.txt
 ```
 
-## How To Run
+The Ciao `.mat` files must live under `ciao/` (or any directory
+specified via `--ciao-dir`).
 
-### 1. Reference backend
+## How to run
 
-Good for quick sanity checks.
+### Reference backend (sanity checks)
 
-```powershell
-py -3 -m jrso --backend reference --preset tiny --output-dir run_outputs\reference_tiny
+```bash
+python -m jrso --backend reference --preset tiny --output-dir run_outputs/reference_tiny
 ```
 
-Available presets:
+Available presets: `tiny`, `small`, `medium`.
 
-- `tiny`
-- `small`
-- `medium`
+### Torch synthetic backend
 
-### 2. Torch synthetic backend
-
-Good for the main scalable synthetic benchmark.
-
-```powershell
-py -3 -m jrso --backend torch --preset gpu_smoke --output-dir run_outputs\gpu_smoke
+```bash
+python -m jrso --backend torch --preset gpu_smoke --output-dir run_outputs/gpu_smoke
+python -m jrso --backend torch --preset large_gpu --output-dir run_outputs/large_gpu --device cuda
 ```
 
-For the main submission-style synthetic benchmark, use:
+### Ciao real-data backend
 
-```powershell
-py -3 -m jrso --backend torch --preset large_gpu --output-dir run_outputs\large_gpu --device cpu
+```bash
+python -m jrso --backend ciao --preset ciao_smoke  --output-dir run_outputs/ciao_smoke   --device cpu
+python -m jrso --backend ciao --preset ciao_medium --output-dir run_outputs/ciao_medium  --device cpu
+python -m jrso --backend ciao --preset ciao_full   --output-dir run_outputs/ciao_full    --device cpu
 ```
 
-Important: `large_gpu` is now intentionally much heavier than before.
-It uses more epochs, more steps, and larger models so the original `JRSO` line gets a fairer chance to improve.
+CUDA versions just swap `--device cpu` for `--device cuda`. Common
+optional overrides for any backend:
 
-Use `--device cuda` on a CUDA machine:
-
-```powershell
-py -3 -m jrso --backend torch --preset large_gpu --output-dir run_outputs\large_gpu --device cuda
+```bash
+python -m jrso --backend ciao --preset ciao_full --epochs 90 --lambda-spread 0.30 \
+    --output-dir run_outputs/ciao_full_lambda030 --device cuda
 ```
 
-If you want to push the original JRSO line even harder, you can further increase epochs:
+## Output files
 
-```powershell
-py -3 -m jrso --backend torch --preset large_gpu --epochs 120 --output-dir run_outputs\large_gpu_e120 --device cuda
-```
+Each run writes to `--output-dir`:
 
-Available presets:
-
-- `gpu_smoke`
-- `large_gpu`
-
-### 3. Ciao real-data backend
-
-Recommended command:
-
-```powershell
-py -3 -m jrso --backend ciao --preset ciao_medium --output-dir run_outputs\ciao_medium --device cpu
-```
-
-If CUDA is available:
-
-```powershell
-py -3 -m jrso --backend ciao --preset ciao_medium --output-dir run_outputs\ciao_medium --device cuda
-```
-
-Available presets:
-
-- `ciao_smoke`
-- `ciao_medium`
-- `ciao_full`
-
-Optional overrides for all backends:
-
-```powershell
-py -3 -m jrso --backend torch --preset gpu_smoke --epochs 4 --lambda-spread 0.22 --output-dir run_outputs\custom
-```
-
-## Model Names In Results
-
-You will now see these model names in Torch/Ciao outputs:
-
-- `RecSys-Only`
-- `IM-Only`
-- `Two-Stage`
-- `JRSO`
-- `JRSO_second`
-- `JRSO_third`
-
-Recommended interpretation:
-
-- use `JRSO` to judge the tuned original method
-- use `JRSO_third` to judge the new algorithm iteration
-
-## Output Files
-
-Each run writes a directory with:
-
-- dataset snapshot: `dataset.npz`, `torch_dataset.npz`, or `ciao_dataset.npz`
-- metrics table: `metrics.csv`, `torch_metrics.csv`, or `ciao_metrics.csv`
-- compact JSON summary: `*_results.json`
-- training history: `*_training_logs.json`
-- significance tests: `*_significance.json`
-- seed selections: `*_seed_summary.json`
-- SVG plots for recommendation, influence, and Pareto comparisons
+- `*_dataset.npz` — saved dataset snapshot (k-core filter, splits,
+  edges, score matrix, etc.)
+- `*_metrics.csv` — final per-model metrics
+- `*_results.json` — same metrics in JSON, plus the run config and
+  uplift summary
+- `*_training_logs.json` — per-epoch training logs
+- `*_seed_summary.json` — chosen seed users per evaluation item per
+  model
+- `*_significance.json` — paired permutation tests on weighted spread
+- SVG plots: training curves, recommendation comparison, influence
+  comparison, Pareto frontier
 
 ## Tests
 
-Run the main test suite with:
-
-```powershell
-py -3 -m unittest tests.test_dataset tests.test_diffusion tests.test_models tests.test_experiment tests.test_torch_pipeline tests.test_ciao_pipeline
+```bash
+python -m unittest tests.test_dataset tests.test_diffusion tests.test_models tests.test_experiment tests.test_torch_pipeline tests.test_ciao_pipeline
 ```
 
-## Suggested Workflow
+The torch / ciao tests run the entire pipeline end-to-end on a small
+synthetic Ciao directory.
 
-If the goal is to improve the joint method further, this is the best order:
+## File map
 
-1. Start with `reference` or `gpu_smoke` for fast iteration.
-2. Validate changes on `ciao_medium`.
-3. Only then scale to `large_gpu` or `ciao_full`.
+```text
+jrso/
+  __main__.py            CLI entrypoint
+  config.py              reference NumPy/autograd dataclasses
+  dataset.py             reference dataset generator
+  diffusion.py           reference IC simulator
+  experiment.py          reference experiment runner
+  metrics.py             metrics, paired permutation test, Pareto frontier
+  models.py              reference NumPy/autograd models
+  optim.py               reference optimiser
 
-The most promising future improvements are:
+  torch_config.py        torch dataset/training/experiment configs
+  torch_dataset.py       sparse synthetic dataset generator
+  torch_models.py        LightGCN encoder, JRSO/JRSO_second/JRSO_third,
+                         IM-only and Two-Stage baselines, greedy seed selector
+  torch_experiment.py    sparse-torch experiment runner
 
-- add a true large-scale ablation on `large_gpu` comparing old and new presets after full CUDA training
-- move from weighted one-hop coverage penalties to a stronger differentiable submodular objective
-- improve `JRSO_second` or retire it if `JRSO_third` consistently dominates it
+  ciao_config.py         Ciao dataset/training/experiment configs
+  ciao_dataset.py        real-data Ciao loader (k-core, MLE edge probs,
+                         model-free score-matrix proxy)
+  ciao_experiment.py     Ciao experiment runner (re-uses torch_experiment)
+
+  plots.py               SVG plots for training curves and comparisons
+
+scripts/
+  inspect_ciao_filter.py k-core size sweep over the raw Ciao data
+  compute_ceilings.py    metric ceiling computation from a saved Ciao run
+
+tests/
+  test_dataset.py            reference dataset
+  test_diffusion.py          reference diffusion
+  test_models.py             reference models
+  test_experiment.py         reference experiment
+  test_torch_pipeline.py     torch backend end-to-end smoke
+  test_ciao_pipeline.py      Ciao backend end-to-end smoke (synthetic .mat files)
+```

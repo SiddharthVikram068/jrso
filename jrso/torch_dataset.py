@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from .torch_config import TorchDatasetConfig
+from .torch_models import _build_lightgcn_adjacency, _csr_to_torch_sparse
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -102,10 +103,20 @@ class SparseSyntheticDataset:
         )
 
     def to_torch(self, device: torch.device) -> dict[str, torch.Tensor]:
+        adjacency = _build_lightgcn_adjacency(
+            train_matrix=self.train_matrix,
+            edge_index=self.edge_index,
+            edge_weight=self.edge_weight,
+            num_users=int(self.config.num_users),
+            num_items=int(self.config.num_items),
+            social_scale=0.5,
+        )
+        sparse_adj = _csr_to_torch_sparse(adjacency).to(device)
         return {
             "edge_index": torch.as_tensor(self.edge_index, dtype=torch.long, device=device),
             "edge_weight": torch.as_tensor(self.edge_weight, dtype=torch.float32, device=device),
             "centrality": torch.as_tensor(self.centrality, dtype=torch.float32, device=device),
+            "lightgcn_adj": sparse_adj,
         }
 
 
