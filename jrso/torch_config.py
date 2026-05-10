@@ -79,6 +79,21 @@ class TorchTrainingConfig:
     use_hard_negatives: bool = True
     warmup_epochs: int = 12
     diffusion_edge_cap: int = 32_768
+    # ----- SOTA upgrades (default-off for backward compatibility) -----
+    # SimGCL-style contrastive loss (Yu et al., SIGIR 2022). When
+    # `simgcl_weight > 0`, the LightGCN encoder produces two extra
+    # noise-perturbed views per training step and an InfoNCE term is
+    # added on user/item embeddings. Typical SOTA settings on sparse
+    # benchmarks: simgcl_eps=0.1, simgcl_weight=0.1-1.0, simgcl_temperature=0.2.
+    simgcl_eps: float = 0.0
+    simgcl_weight: float = 0.0
+    simgcl_temperature: float = 0.2
+    # Adaptive (learnable) per-layer LightGCN combination weights.
+    # When False (default), uniform mean over layers (vanilla LightGCN).
+    learnable_layer_weights: bool = False
+    # Hardness-aware DNS: sample K hardest negatives uniformly from the
+    # candidate pool instead of taking the single argmax. 0 disables.
+    dns_top_k: int = 0
     seed: int = 321
 
     def replace(self, **changes: object) -> "TorchTrainingConfig":
@@ -122,6 +137,12 @@ class TorchExperimentConfig:
                 amp=False,
                 use_hard_negatives=True,
                 warmup_epochs=2,
+                # SOTA upgrades (smoke-sized)
+                simgcl_eps=0.10,
+                simgcl_weight=0.05,
+                simgcl_temperature=0.20,
+                learnable_layer_weights=True,
+                dns_top_k=4,
                 seed=401,
             )
             jrso = recsys.replace(lambda_spread=0.15, seed=402)
@@ -149,11 +170,11 @@ class TorchExperimentConfig:
         else:
             recsys = TorchTrainingConfig(
                 hidden_dim=128,
-                num_layers=3,
+                num_layers=4,
                 dropout=0.10,
                 learning_rate=4e-3,
                 weight_decay=1e-5,
-                epochs=120,
+                epochs=200,
                 steps_per_epoch=40,
                 batch_size=4096,
                 negative_candidates=64,
@@ -164,7 +185,13 @@ class TorchExperimentConfig:
                 eval_batch_size=1024,
                 amp=True,
                 use_hard_negatives=True,
-                warmup_epochs=20,
+                warmup_epochs=24,
+                # SOTA upgrades for the GPU benchmark
+                simgcl_eps=0.10,
+                simgcl_weight=0.20,
+                simgcl_temperature=0.20,
+                learnable_layer_weights=True,
+                dns_top_k=8,
                 seed=701,
             )
             jrso = recsys.replace(

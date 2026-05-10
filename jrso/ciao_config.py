@@ -133,6 +133,12 @@ class CiaoExperimentConfig:
                 amp=False,
                 use_hard_negatives=True,
                 warmup_epochs=3,
+                # SOTA upgrades (small values for fast smoke validation)
+                simgcl_eps=0.10,
+                simgcl_weight=0.05,
+                simgcl_temperature=0.20,
+                learnable_layer_weights=True,
+                dns_top_k=4,
                 seed=601,
             )
             jrso = recsys.replace(lambda_spread=0.15, seed=602)
@@ -202,16 +208,21 @@ class CiaoExperimentConfig:
                 seed=704,
             )
         else:
+            # SOTA-targeting preset for ciao_full. The combination of
+            # SimGCL contrastive auxiliary loss (eps=0.1, weight=0.2),
+            # learnable layer combination, hardness-aware DNS (top-8),
+            # 4 LightGCN layers, and 200 epochs targets numbers above
+            # the published SocialLGN / DiffNet++ frontier on Ciao.
             recsys = TorchTrainingConfig(
                 hidden_dim=128,
-                num_layers=3,
+                num_layers=4,
                 dropout=0.10,
-                learning_rate=4e-3,
+                learning_rate=3e-3,
                 weight_decay=1e-5,
-                epochs=60,
-                steps_per_epoch=25,
+                epochs=200,
+                steps_per_epoch=30,
                 batch_size=2048,
-                negative_candidates=48,
+                negative_candidates=64,
                 spread_items_per_step=3,
                 lambda_spread=0.10,
                 diffusion_steps=3,
@@ -219,31 +230,41 @@ class CiaoExperimentConfig:
                 eval_batch_size=1024,
                 amp=False,
                 use_hard_negatives=True,
-                warmup_epochs=12,
+                warmup_epochs=20,
                 diffusion_edge_cap=20_000,
+                # SOTA upgrades
+                simgcl_eps=0.10,
+                simgcl_weight=0.20,
+                simgcl_temperature=0.20,
+                learnable_layer_weights=True,
+                dns_top_k=8,
                 seed=801,
             )
             jrso = recsys.replace(lambda_spread=0.20, seed=802)
             jrso_second = recsys.replace(
-                hidden_dim=128,
-                num_layers=3,
+                hidden_dim=160,
+                num_layers=4,
                 dropout=0.12,
-                learning_rate=3e-3,
-                negative_candidates=48,
-                spread_items_per_step=3,
+                learning_rate=2.5e-3,
+                negative_candidates=64,
+                spread_items_per_step=4,
                 lambda_spread=0.24,
-                warmup_epochs=14,
+                warmup_epochs=24,
+                # Slightly higher contrastive weight for the stronger
+                # JRSO_second variant; helps regularise the larger model.
+                simgcl_weight=0.25,
                 seed=803,
             )
             jrso_third = recsys.replace(
-                hidden_dim=128,
-                num_layers=3,
+                hidden_dim=160,
+                num_layers=4,
                 dropout=0.12,
-                learning_rate=3e-3,
-                negative_candidates=48,
-                spread_items_per_step=3,
+                learning_rate=2.5e-3,
+                negative_candidates=64,
+                spread_items_per_step=4,
                 lambda_spread=0.28,
-                warmup_epochs=14,
+                warmup_epochs=24,
+                simgcl_weight=0.20,
                 seed=804,
             )
         return cls(

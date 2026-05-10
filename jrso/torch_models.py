@@ -144,6 +144,7 @@ class LightGCNEncoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         dropout: float,
+        learnable_layer_weights: bool = False,
     ) -> None:
         super().__init__()
         self.num_users = num_users
@@ -155,32 +156,84 @@ class LightGCNEncoder(nn.Module):
         self.item_embedding = nn.Embedding(num_items, hidden_dim)
         nn.init.normal_(self.user_embedding.weight, std=0.05)
         nn.init.normal_(self.item_embedding.weight, std=0.05)
+        # Learnable per-layer combination weights (softmax-normalised) so the
+        # encoder can deweight the deepest, most over-smoothed layers if they
+        # hurt recommendation accuracy. Defaults to uniform mean (vanilla
+        # LightGCN) when learnable_layer_weights=False.
+        self.learnable_layer_weights = bool(learnable_layer_weights)
+        if self.learnable_layer_weights:
+            self.layer_logits = nn.Parameter(torch.zeros(self.num_layers + 1))
+        else:
+            self.register_parameter("layer_logits", None)
 
     def all_embeddings(self) -> torch.Tensor:
         return torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
 
-    def forward(self, lightgcn_adj: torch.sparse.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        embeddings = self.all_embeddings()
-        layer_outputs = [embeddings]
-        current = embeddings
-        # torch.sparse.mm on CUDA does not implement fp16 ("addmm_sparse_cuda"
-        # not implemented for 'Half'), so we always run the sparse propagation
-        # in float32 even when an outer autocast context is fp16/bf16.
-        out_dtype = current.dtype
+    @staticmethod
+    def _simgcl_noise(x: torch.Tensor, eps: float) -> torch.Tensor:
+        """SimGCL-style noise (Yu et al., SIGIR 2022).
+
+        Samples a unit-direction perturbation in the *same hyperoctant*
+        as the original embedding row, scaled by eps. The construction
+        ``delta = eps * sign(x) * normalize(uniform[0,1])`` keeps every
+        noise component in [0, eps] and aligned with x, so the perturbed
+        embedding stays close to x in cosine space.
+        """
+
+        if eps <= 0.0:
+            return torch.zeros_like(x)
+        rand = torch.rand_like(x)
+        rand = rand / rand.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return eps * torch.sign(x) * rand
+
+    def _aggregate(self, layer_outputs: list[torch.Tensor]) -> torch.Tensor:
+        stacked = torch.stack(layer_outputs, dim=0)
+        if self.learnable_layer_weights and self.layer_logits is not None:
+            weights = torch.softmax(self.layer_logits, dim=0)
+            return (weights.view(-1, 1, 1) * stacked).sum(dim=0)
+        return stacked.mean(dim=0)
+
+    def _propagate(
+        self,
+        lightgcn_adj: torch.sparse.Tensor,
+        embeddings: torch.Tensor,
+        perturb_eps: float = 0.0,
+    ) -> torch.Tensor:
+        """Run the LightGCN propagation and return the layer-aggregated repr.
+
+        When ``perturb_eps > 0`` we add SimGCL noise to each post-layer
+        embedding; this gives a differentiable contrastive view of the
+        graph without modifying the adjacency itself.
+        """
+
+        out_dtype = embeddings.dtype
         sparse_dtype = lightgcn_adj.dtype
         if sparse_dtype not in (torch.float32, torch.float64):
             lightgcn_adj_fp = lightgcn_adj.to(torch.float32)
         else:
             lightgcn_adj_fp = lightgcn_adj
-        with torch.amp.autocast(device_type=current.device.type, enabled=False):
-            current_fp = current.to(torch.float32)
+        layer_outputs = [embeddings]
+        # torch.sparse.mm on CUDA does not implement fp16 ("addmm_sparse_cuda"
+        # not implemented for 'Half"), so we always run the sparse propagation
+        # in float32 even when an outer autocast context is fp16/bf16.
+        with torch.amp.autocast(device_type=embeddings.device.type, enabled=False):
+            current_fp = embeddings.to(torch.float32)
             for _ in range(self.num_layers):
                 current_fp = torch.sparse.mm(lightgcn_adj_fp, current_fp)
                 if self.dropout > 0.0 and self.training:
                     current_fp = F.dropout(current_fp, p=self.dropout)
+                if perturb_eps > 0.0 and self.training:
+                    current_fp = current_fp + self._simgcl_noise(current_fp, perturb_eps)
                 layer_outputs.append(current_fp.to(out_dtype))
-        stacked = torch.stack(layer_outputs, dim=0)
-        averaged = stacked.mean(dim=0)
+        return self._aggregate(layer_outputs)
+
+    def forward(
+        self,
+        lightgcn_adj: torch.sparse.Tensor,
+        perturb_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        embeddings = self.all_embeddings()
+        averaged = self._propagate(lightgcn_adj, embeddings, perturb_eps=perturb_eps)
         user_repr = averaged[: self.num_users]
         item_repr = averaged[self.num_users :]
         return user_repr, item_repr
@@ -212,6 +265,7 @@ class BaseTorchRecommender(nn.Module):
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,
             dropout=config.dropout,
+            learnable_layer_weights=getattr(config, "learnable_layer_weights", False),
         )
         self.user_bias = nn.Embedding(self.num_users, 1)
         self.item_bias = nn.Embedding(self.num_items, 1)
@@ -274,7 +328,24 @@ class BaseTorchRecommender(nn.Module):
         neg_score = (u.unsqueeze(1) * neg).sum(dim=-1) / scale + self.user_bias(users) + self.item_bias(neg_candidates).squeeze(-1) + self.global_bias
 
         if self.config.use_hard_negatives:
-            hardest = neg_score.max(dim=1).values
+            dns_top_k = int(getattr(self.config, "dns_top_k", 0))
+            if dns_top_k > 1 and dns_top_k <= neg_score.shape[1]:
+                # Hardness-aware DNS (Zhang et al., SIGIR 2013): instead
+                # of always taking the single argmax, sample uniformly
+                # from the top-K hardest candidates. This avoids
+                # overfitting to the absolutely-hardest negative (which
+                # is often a false negative) while still pulling the
+                # decision boundary toward informative negatives.
+                top_scores, _ = neg_score.topk(dns_top_k, dim=1)
+                idx = torch.randint(
+                    low=0,
+                    high=dns_top_k,
+                    size=(neg_score.shape[0], 1),
+                    device=neg_score.device,
+                )
+                hardest = top_scores.gather(1, idx).squeeze(-1)
+            else:
+                hardest = neg_score.max(dim=1).values
             base_loss = F.softplus(hardest - pos_score).mean()
             mean_loss = F.softplus(neg_score.mean(dim=1) - pos_score).mean()
             loss = 0.7 * base_loss + 0.3 * mean_loss
@@ -304,6 +375,53 @@ class BaseTorchRecommender(nn.Module):
         }
         return loss, metrics
 
+    # ---------------- SimGCL contrastive auxiliary loss ----------------
+    def _simgcl_loss(
+        self,
+        graph: dict[str, torch.Tensor],
+        users: torch.Tensor,
+        pos_items: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """SimGCL InfoNCE auxiliary loss (Yu et al., SIGIR 2022).
+
+        Two perturbed encoder views are computed; a symmetric InfoNCE
+        loss pulls each user (item) close to its own perturbed twin and
+        away from other users (items) in the batch. This is what powers
+        most current SOTA on sparse RecSys benchmarks (LightGCL,
+        SimGCL, NCL, HCCF). When ``simgcl_weight`` or ``simgcl_eps`` is
+        zero we short-circuit and return zero.
+        """
+
+        eps = float(getattr(self.config, "simgcl_eps", 0.0))
+        weight = float(getattr(self.config, "simgcl_weight", 0.0))
+        if eps <= 0.0 or weight <= 0.0:
+            zero = torch.tensor(0.0, device=users.device)
+            return zero, {"simgcl_loss": 0.0}
+        temperature = float(getattr(self.config, "simgcl_temperature", 0.2))
+        u1, i1 = self.encoder(graph["lightgcn_adj"], perturb_eps=eps)
+        u2, i2 = self.encoder(graph["lightgcn_adj"], perturb_eps=eps)
+        # User contrastive view (use only batch users).
+        u1b = F.normalize(u1[users], dim=-1)
+        u2b = F.normalize(u2[users], dim=-1)
+        user_logits = (u1b @ u2b.T) / max(temperature, 1e-3)
+        user_labels = torch.arange(users.shape[0], device=users.device)
+        user_loss = 0.5 * (
+            F.cross_entropy(user_logits, user_labels)
+            + F.cross_entropy(user_logits.T, user_labels)
+        )
+        # Item contrastive view (use only batch positive items).
+        unique_items = torch.unique(pos_items)
+        i1b = F.normalize(i1[unique_items], dim=-1)
+        i2b = F.normalize(i2[unique_items], dim=-1)
+        item_logits = (i1b @ i2b.T) / max(temperature, 1e-3)
+        item_labels = torch.arange(unique_items.shape[0], device=unique_items.device)
+        item_loss = 0.5 * (
+            F.cross_entropy(item_logits, item_labels)
+            + F.cross_entropy(item_logits.T, item_labels)
+        )
+        loss = weight * (user_loss + item_loss)
+        return loss, {"simgcl_loss": float(loss.detach().item())}
+
     def compute_loss(
         self,
         graph: dict[str, torch.Tensor],
@@ -319,6 +437,13 @@ class BaseTorchRecommender(nn.Module):
             pos_items=batch["pos_items"],
             neg_candidates=batch["neg_candidates"],
         )
+        cl_loss, cl_metrics = self._simgcl_loss(
+            graph=graph,
+            users=batch["users"],
+            pos_items=batch["pos_items"],
+        )
+        loss = loss + cl_loss
+        metrics.update(cl_metrics)
         metrics["spread_bonus"] = 0.0
         return loss, metrics
 
@@ -656,12 +781,19 @@ class TorchJRSO(BaseTorchRecommender):
         edge_alignment = self._edge_alignment_loss(user_repr, graph)
         warmup = max(1, self.config.warmup_epochs)
         lambda_scale = min(1.0, float(epoch + 1) / float(warmup))
+        cl_loss, cl_metrics = self._simgcl_loss(
+            graph=graph,
+            users=batch["users"],
+            pos_items=batch["pos_items"],
+        )
         loss = (
             rec_loss
             - (self.config.lambda_spread * lambda_scale * spread_bonus)
             + self.overlap_weight * overlap_penalty
             + self.edge_alignment_weight * edge_alignment
+            + cl_loss
         )
+        metrics.update(cl_metrics)
         metrics["spread_bonus"] = float(spread_bonus.detach().item())
         metrics["edge_alignment"] = float(edge_alignment.detach().item())
         return loss, metrics
