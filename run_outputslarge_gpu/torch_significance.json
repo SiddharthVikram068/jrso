@@ -1,12 +1,22 @@
 {
   "JRSO_second_vs_JRSO_weighted_spread": {
-    "observed_mean_difference": 0.3576488494873047,
-    "p_value": 0.9205397301349325,
+    "observed_mean_difference": 5.630693435668945,
+    "p_value": 0.1504247876061969,
     "significant": false
   },
   "JRSO_second_vs_Two-Stage_weighted_spread": {
-    "observed_mean_difference": 7.943157196044922,
-    "p_value": 0.07546226886556721,
+    "observed_mean_difference": 6.179544448852539,
+    "p_value": 0.13393303348325838,
     "significant": false
+  },
+  "JRSO_third_vs_JRSO_second_weighted_spread": {
+    "observed_mean_difference": 4.335504531860352,
+    "p_value": 0.21889055472263869,
+    "significant": false
+  },
+  "JRSO_third_vs_Two-Stage_weighted_spread": {
+    "observed_mean_difference": 10.51504898071289,
+    "p_value": 0.006496751624187906,
+    "significant": true
   }
 }
