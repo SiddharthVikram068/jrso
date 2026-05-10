@@ -32,6 +32,7 @@ from .torch_models import (
     InfluenceOnlyBaseline,
     TorchJRSO,
     TorchJRSOSecond,
+    TorchJRSOThird,
     TorchRecSysOnly,
     TwoStageBaseline,
 )
@@ -125,6 +126,36 @@ def _summarize_uplift(results: dict[str, dict[str, Any]]) -> dict[str, dict[str,
                 results["RecSys-Only"]["combined_score"],
             ),
         }
+    if "JRSO_third" in results and "RecSys-Only" in results:
+        uplift["JRSO_third_vs_RecSys-Only"] = {
+            "ndcg@10_pct": safe_pct(
+                metric("JRSO_third", "ndcg@10", "recommendation"),
+                metric("RecSys-Only", "ndcg@10", "recommendation"),
+            ),
+            "weighted_spread_rate_pct": safe_pct(
+                metric("JRSO_third", "weighted_spread_rate", "influence"),
+                metric("RecSys-Only", "weighted_spread_rate", "influence"),
+            ),
+            "combined_score_pct": safe_pct(
+                results["JRSO_third"]["combined_score"],
+                results["RecSys-Only"]["combined_score"],
+            ),
+        }
+    if "JRSO_third" in results and "Two-Stage" in results:
+        uplift["JRSO_third_vs_Two-Stage"] = {
+            "ndcg@10_pct": safe_pct(
+                metric("JRSO_third", "ndcg@10", "recommendation"),
+                metric("Two-Stage", "ndcg@10", "recommendation"),
+            ),
+            "weighted_spread_rate_pct": safe_pct(
+                metric("JRSO_third", "weighted_spread_rate", "influence"),
+                metric("Two-Stage", "weighted_spread_rate", "influence"),
+            ),
+            "combined_score_pct": safe_pct(
+                results["JRSO_third"]["combined_score"],
+                results["Two-Stage"]["combined_score"],
+            ),
+        }
     return uplift
 
 
@@ -180,6 +211,14 @@ def run_ciao_experiment(config: CiaoExperimentConfig) -> dict[str, Any]:
         config.jrso_second,
         output_dir,
     )
+    print("[ciao] Training JRSO_third ...")
+    jrso_third_model = _train_model(
+        TorchJRSOThird(dataset, config.jrso_third),
+        dataset,
+        graph,
+        config.jrso_third,
+        output_dir,
+    )
 
     im_only_model = InfluenceOnlyBaseline(dataset)
     two_stage_model = TwoStageBaseline(dataset, recsys_model, graph)
@@ -206,12 +245,17 @@ def run_ciao_experiment(config: CiaoExperimentConfig) -> dict[str, Any]:
             jrso_second_model, dataset, graph, config.recommendation_k,
             alpha=config.combined_alpha, device=device,
         ),
+        jrso_third_model.model_name: _evaluate_trainable_model(
+            jrso_third_model, dataset, graph, config.recommendation_k,
+            alpha=config.combined_alpha, device=device,
+        ),
     }
 
     history_payload = {
         recsys_model.model_name: recsys_model.artifacts.history,
         jrso_model.model_name: jrso_model.artifacts.history,
         jrso_second_model.model_name: jrso_second_model.artifacts.history,
+        jrso_third_model.model_name: jrso_third_model.artifacts.history,
     }
     compact_results = {
         model_name: {
@@ -244,6 +288,11 @@ def run_ciao_experiment(config: CiaoExperimentConfig) -> dict[str, Any]:
             results["JRSO"]["per_item"]["weighted_spread_mean"],
             results["RecSys-Only"]["per_item"]["weighted_spread_mean"],
             seed=config.seed + 23,
+        ),
+        "JRSO_third_vs_Two-Stage_weighted_spread": paired_permutation_test(
+            results["JRSO_third"]["per_item"]["weighted_spread_mean"],
+            results["Two-Stage"]["per_item"]["weighted_spread_mean"],
+            seed=config.seed + 29,
         ),
     }
     uplift = _summarize_uplift(results)

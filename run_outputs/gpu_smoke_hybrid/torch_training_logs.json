@@ -1,0 +1,82 @@
+{
+  "RecSys-Only": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7089859247207642,
+      "rec_loss": 0.7089859247207642,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.035099939171844466,
+      "learning_rate": 0.003
+    },
+    {
+      "epoch": 1.0,
+      "objective": 0.7064153750737509,
+      "rec_loss": 0.7064153750737509,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.041965563804883484,
+      "learning_rate": 0.001725
+    }
+  ],
+  "JRSO": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7060312032699585,
+      "rec_loss": 0.7081383268038431,
+      "spread_bonus": 0.09365048011144002,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.052830321641657504,
+      "learning_rate": 0.003
+    },
+    {
+      "epoch": 1.0,
+      "objective": 0.7012562354405721,
+      "rec_loss": 0.7054628531138102,
+      "spread_bonus": 0.09348046282927196,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.05616730139760938,
+      "learning_rate": 0.001725
+    }
+  ],
+  "JRSO_second": [
+    {
+      "epoch": 0.0,
+      "objective": 3.0310436884562173,
+      "rec_loss": 3.0440783500671387,
+      "spread_bonus": 0.08675940831502278,
+      "edge_alignment": 0.09734498957792918,
+      "val_ndcg@10": 0.057670836066859354,
+      "learning_rate": 0.003
+    },
+    {
+      "epoch": 1.0,
+      "objective": 3.0239105224609375,
+      "rec_loss": 3.038888613382975,
+      "spread_bonus": 0.09479279071092606,
+      "edge_alignment": 0.09715162714322408,
+      "val_ndcg@10": 0.05727207071723226,
+      "learning_rate": 0.001725
+    }
+  ],
+  "JRSO_third": [
+    {
+      "epoch": 0.0,
+      "objective": 2.4264888763427734,
+      "rec_loss": 2.4312145709991455,
+      "spread_bonus": 0.043906266490618386,
+      "edge_alignment": 0.0945924570163091,
+      "val_ndcg@10": 0.04388276530522206,
+      "learning_rate": 0.0025
+    },
+    {
+      "epoch": 1.0,
+      "objective": 2.4182267983754477,
+      "rec_loss": 2.4270164171854653,
+      "spread_bonus": 0.05768666540582975,
+      "edge_alignment": 0.09202408293883006,
+      "val_ndcg@10": 0.05372188054530981,
+      "learning_rate": 0.0014375
+    }
+  ]
+}

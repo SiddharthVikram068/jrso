@@ -89,6 +89,7 @@ class CiaoExperimentTests(unittest.TestCase):
                 recsys=config.recsys.replace(epochs=1, steps_per_epoch=1, amp=False),
                 jrso=config.jrso.replace(epochs=1, steps_per_epoch=1, amp=False),
                 jrso_second=config.jrso_second.replace(epochs=1, steps_per_epoch=1, amp=False),
+                jrso_third=config.jrso_third.replace(epochs=1, steps_per_epoch=1, amp=False),
                 output_dir=out_dir,
                 recommendation_k=config.recommendation_k,
                 combined_alpha=config.combined_alpha,
@@ -96,7 +97,7 @@ class CiaoExperimentTests(unittest.TestCase):
             )
             result = run_ciao_experiment(config)
             self.assertEqual(result["backend"], "ciao")
-            for required in ("RecSys-Only", "IM-Only", "Two-Stage", "JRSO", "JRSO_second"):
+            for required in ("RecSys-Only", "IM-Only", "Two-Stage", "JRSO", "JRSO_second", "JRSO_third"):
                 self.assertIn(required, result["results"])
             self.assertTrue((out_dir / "ciao_metrics.csv").exists())
             self.assertTrue((out_dir / "ciao_results.json").exists())

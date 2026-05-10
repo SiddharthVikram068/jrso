@@ -25,6 +25,7 @@ class TorchPipelineTests(unittest.TestCase):
                 recsys=config.recsys.replace(epochs=1, steps_per_epoch=1, amp=False),
                 jrso=config.jrso.replace(epochs=1, steps_per_epoch=1, amp=False),
                 jrso_second=config.jrso_second.replace(epochs=1, steps_per_epoch=1, amp=False),
+                jrso_third=config.jrso_third.replace(epochs=1, steps_per_epoch=1, amp=False),
                 output_dir=config.output_dir,
                 recommendation_k=config.recommendation_k,
                 combined_alpha=config.combined_alpha,
@@ -34,6 +35,7 @@ class TorchPipelineTests(unittest.TestCase):
             self.assertEqual(result["backend"], "torch")
             self.assertIn("JRSO", result["results"])
             self.assertIn("JRSO_second", result["results"])
+            self.assertIn("JRSO_third", result["results"])
             self.assertIn("Two-Stage", result["results"])
             self.assertTrue((tmpdir / "torch_metrics.csv").exists())
             self.assertTrue((tmpdir / "torch_training_logs.json").exists())

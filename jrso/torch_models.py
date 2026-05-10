@@ -509,6 +509,222 @@ class TorchJRSOSecond(TorchJRSO):
         return loss, metrics
 
 
+class TorchJRSOThird(TorchJRSO):
+    model_name = "JRSO_third"
+
+    def __init__(self, dataset: SparseSyntheticDataset, config: TorchTrainingConfig) -> None:
+        super().__init__(dataset, config)
+        hidden_dim = config.hidden_dim
+        interaction_weights = dataset.train_matrix.astype(np.float32)
+        row_sum = np.clip(interaction_weights.sum(axis=1, keepdims=True), 1.0, None)
+        interaction_weights /= row_sum
+        self.register_buffer(
+            "interaction_weights",
+            torch.as_tensor(interaction_weights, dtype=torch.float32),
+        )
+        self.gate_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.history_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.affinity_head = nn.Sequential(
+            nn.Linear(hidden_dim * 4 + 1, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.seed_head = nn.Sequential(
+            nn.Linear(hidden_dim * 4 + 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.src_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.dst_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.item_projection = nn.Linear(hidden_dim, hidden_dim)
+
+    def encode_users(self, graph: dict[str, torch.Tensor]) -> torch.Tensor:
+        social_repr = self.encoder(graph["edge_index"])
+        item_repr = self.item_representations()
+        history_repr = self.interaction_weights.to(item_repr.device) @ item_repr
+        history_repr = F.normalize(history_repr, dim=-1)
+        centrality = graph["centrality"].to(dtype=social_repr.dtype).unsqueeze(1)
+        gate_features = torch.cat([social_repr, history_repr, centrality], dim=-1)
+        gate = torch.sigmoid(self.gate_head(gate_features))
+        residual = self.history_projection(
+            torch.cat([social_repr * history_repr, torch.abs(social_repr - history_repr), centrality], dim=-1)
+        )
+        fused = gate * social_repr + (1.0 - gate) * history_repr + 0.20 * residual
+        return F.normalize(fused, dim=-1)
+
+    def _recommendation_loss(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        users: torch.Tensor,
+        pos_items: torch.Tensor,
+        neg_candidates: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        pos_scores = (user_repr[users] * item_repr[pos_items]).sum(dim=-1) / np.sqrt(user_repr.shape[1])
+        candidate_scores = self._candidate_scores(user_repr, item_repr, users, neg_candidates)
+        logits = torch.cat([pos_scores.unsqueeze(1), candidate_scores], dim=1)
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+        ce_loss = F.cross_entropy(logits, labels)
+        hardest_negative = candidate_scores.max(dim=1).values
+        margin_loss = F.softplus(hardest_negative - pos_scores).mean()
+        loss = 0.70 * ce_loss + 0.30 * margin_loss
+        metrics = {
+            "rec_loss": float(loss.detach().item()),
+            "pos_score": float(pos_scores.detach().mean().item()),
+            "neg_score": float(candidate_scores.detach().mean().item()),
+        }
+        return loss, metrics
+
+    def _affinity_logits(self, user_repr: torch.Tensor, item_repr: torch.Tensor) -> torch.Tensor:
+        item_expanded = item_repr.unsqueeze(0).expand_as(user_repr)
+        centrality = torch.as_tensor(
+            self.dataset.centrality,
+            dtype=user_repr.dtype,
+            device=user_repr.device,
+        ).unsqueeze(1)
+        features = torch.cat(
+            [user_repr, item_expanded, user_repr * item_expanded, torch.abs(user_repr - item_expanded), centrality],
+            dim=-1,
+        )
+        return self.affinity_head(features).squeeze(-1)
+
+    def _seed_logits(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        affinity_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        src, dst = graph["edge_index"]
+        affinity = torch.sigmoid(affinity_logits)
+        propagation = torch.zeros_like(affinity)
+        propagation.index_add_(0, src, graph["edge_weight"] * affinity[dst])
+        propagation = propagation / propagation.max().clamp(min=1e-6)
+        centrality = graph["centrality"].to(dtype=user_repr.dtype).unsqueeze(1)
+        item_expanded = item_repr.unsqueeze(0).expand_as(user_repr)
+        features = torch.cat(
+            [
+                user_repr,
+                item_expanded,
+                user_repr * item_expanded,
+                torch.abs(user_repr - item_expanded),
+                centrality,
+                propagation.unsqueeze(1),
+            ],
+            dim=-1,
+        )
+        return self.seed_head(features).squeeze(-1) + 0.45 * affinity_logits + 0.20 * propagation + self.seed_bias
+
+    def _edge_probabilities(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        affinity_logits: torch.Tensor,
+        affinity: torch.Tensor,
+    ) -> torch.Tensor:
+        del affinity_logits
+        src, dst = graph["edge_index"]
+        src_repr = self.src_projection(user_repr[src])
+        dst_repr = self.dst_projection(user_repr[dst])
+        item_context = self.item_projection(item_repr)
+        edge_logits = (
+            0.55 * (src_repr * dst_repr).sum(dim=-1)
+            + 0.25 * (src_repr * item_context.unsqueeze(0)).sum(dim=-1)
+            + 0.20 * (dst_repr * item_context.unsqueeze(0)).sum(dim=-1)
+        ) / np.sqrt(user_repr.shape[1])
+        edge_prob = graph["edge_weight"] * torch.sigmoid(edge_logits) * affinity[src] * affinity[dst]
+        return edge_prob.clamp(max=0.95)
+
+    def _diffusion_bonus(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        src, dst = graph["edge_index"]
+        affinity_logits = self._affinity_logits(user_repr, item_repr)
+        affinity = torch.sigmoid(affinity_logits)
+        seed_logits = self._seed_logits(user_repr, item_repr, graph, affinity_logits)
+        seed_prob = continuous_seed_probabilities(seed_logits, self.dataset.config.k_seeds)
+        edge_prob = self._edge_probabilities(user_repr, item_repr, graph, affinity_logits, affinity)
+        hidden = seed_prob
+        for _ in range(self.config.diffusion_steps):
+            safe_term = torch.clamp(1.0 - edge_prob * hidden[src], min=1e-6, max=1.0)
+            log_prod = torch.zeros(hidden.shape[0], device=hidden.device, dtype=hidden.dtype)
+            log_prod.index_add_(0, dst, safe_term.log())
+            hidden = 1.0 - (1.0 - hidden) * log_prod.exp()
+        weighted_spread = (hidden * affinity).mean()
+        return weighted_spread, seed_prob, edge_prob
+
+    def compute_loss(
+        self,
+        graph: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+        epoch: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        user_repr = self.encode_users(graph)
+        item_repr = self.item_representations()
+        rec_loss, metrics = self._recommendation_loss(
+            user_repr=user_repr,
+            item_repr=item_repr,
+            users=batch["users"],
+            pos_items=batch["pos_items"],
+            neg_candidates=batch["neg_candidates"],
+        )
+        unique_items = torch.unique(batch["pos_items"])
+        if unique_items.numel() > self.config.spread_items_per_step:
+            permutation = torch.randperm(unique_items.numel(), device=unique_items.device)
+            unique_items = unique_items[permutation[: self.config.spread_items_per_step]]
+        diffusion_terms: list[torch.Tensor] = []
+        overlap_terms: list[torch.Tensor] = []
+        for item_idx in unique_items:
+            spread_value, seed_prob, edge_prob = self._diffusion_bonus(
+                user_repr=user_repr,
+                item_repr=item_repr[item_idx],
+                graph=graph,
+            )
+            diffusion_terms.append(spread_value)
+            src = graph["edge_index"][0]
+            dst = graph["edge_index"][1]
+            overlap_terms.append((seed_prob[src] * seed_prob[dst] * edge_prob).mean())
+        spread_bonus = torch.stack(diffusion_terms).mean() if diffusion_terms else torch.tensor(0.0, device=user_repr.device)
+        overlap_penalty = torch.stack(overlap_terms).mean() if overlap_terms else torch.tensor(0.0, device=user_repr.device)
+        lambda_scale = min(1.0, float(epoch + 1) / max(1, self.config.warmup_epochs))
+
+        src, dst = graph["edge_index"]
+        sample_size = min(src.shape[0], 16_384)
+        sampled_edges = torch.randperm(src.shape[0], device=src.device)[:sample_size]
+        edge_src = src[sampled_edges]
+        edge_dst = dst[sampled_edges]
+        edge_prior_logits = (
+            self.src_projection(user_repr[edge_src]) * self.dst_projection(user_repr[edge_dst])
+        ).sum(dim=-1) / np.sqrt(user_repr.shape[1])
+        edge_alignment = F.mse_loss(torch.sigmoid(edge_prior_logits), graph["edge_weight"][sampled_edges])
+
+        loss = (
+            rec_loss
+            - (self.config.lambda_spread * lambda_scale * spread_bonus)
+            + 0.08 * edge_alignment
+            + 0.03 * overlap_penalty
+        )
+        metrics["spread_bonus"] = float(spread_bonus.detach().item())
+        metrics["edge_alignment"] = float(edge_alignment.detach().item())
+        return loss, metrics
+
+
 class InfluenceOnlyBaseline:
     model_name = "IM-Only"
 

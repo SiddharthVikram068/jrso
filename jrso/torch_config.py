@@ -95,6 +95,7 @@ class TorchExperimentConfig:
     recsys: TorchTrainingConfig
     jrso: TorchTrainingConfig
     jrso_second: TorchTrainingConfig
+    jrso_third: TorchTrainingConfig
     output_dir: Path
     recommendation_k: tuple[int, ...] = (10, 20)
     combined_alpha: float = 0.5
@@ -131,25 +132,75 @@ class TorchExperimentConfig:
                 warmup_epochs=1,
                 seed=403,
             )
+            jrso_third = recsys.replace(
+                hidden_dim=72,
+                num_layers=4,
+                dropout=0.10,
+                learning_rate=2.5e-3,
+                negative_candidates=24,
+                spread_items_per_step=4,
+                lambda_spread=0.28,
+                use_hard_negatives=True,
+                warmup_epochs=1,
+                seed=404,
+            )
         else:
-            recsys = TorchTrainingConfig(seed=701)
-            jrso = recsys.replace(lambda_spread=0.18, seed=702)
-            jrso_second = recsys.replace(
+            recsys = TorchTrainingConfig(
                 hidden_dim=160,
-                num_layers=6,
-                dropout=0.25,
-                learning_rate=1.5e-3,
-                negative_candidates=40,
-                spread_items_per_step=8,
-                lambda_spread=0.26,
+                num_layers=5,
+                dropout=0.18,
+                learning_rate=1.6e-3,
+                weight_decay=1e-5,
+                epochs=90,
+                steps_per_epoch=28,
+                batch_size=4096,
+                negative_candidates=32,
+                spread_items_per_step=6,
+                lambda_spread=0.15,
+                diffusion_steps=5,
+                gradient_clip_norm=5.0,
+                eval_batch_size=1024,
+                amp=True,
+                use_hard_negatives=True,
                 warmup_epochs=12,
+                seed=701,
+            )
+            jrso = recsys.replace(
+                learning_rate=1.4e-3,
+                negative_candidates=36,
+                spread_items_per_step=8,
+                lambda_spread=0.24,
+                warmup_epochs=16,
+                seed=702,
+            )
+            jrso_second = recsys.replace(
+                hidden_dim=192,
+                num_layers=6,
+                dropout=0.22,
+                learning_rate=1.2e-3,
+                negative_candidates=48,
+                spread_items_per_step=10,
+                lambda_spread=0.32,
+                warmup_epochs=18,
                 seed=703,
+            )
+            jrso_third = recsys.replace(
+                hidden_dim=224,
+                num_layers=5,
+                dropout=0.20,
+                learning_rate=1.1e-3,
+                negative_candidates=48,
+                spread_items_per_step=10,
+                lambda_spread=0.34,
+                warmup_epochs=18,
+                seed=704,
             )
         return cls(
             dataset=dataset,
             recsys=recsys,
             jrso=jrso,
             jrso_second=jrso_second,
+            jrso_third=jrso_third,
             output_dir=output_dir,
         )
 
@@ -159,6 +210,7 @@ class TorchExperimentConfig:
             "recsys": self.recsys.to_dict(),
             "jrso": self.jrso.to_dict(),
             "jrso_second": self.jrso_second.to_dict(),
+            "jrso_third": self.jrso_third.to_dict(),
             "output_dir": str(self.output_dir),
             "recommendation_k": list(self.recommendation_k),
             "combined_alpha": self.combined_alpha,

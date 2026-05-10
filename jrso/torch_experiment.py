@@ -18,6 +18,7 @@ from .torch_models import (
     InfluenceOnlyBaseline,
     TorchJRSO,
     TorchJRSOSecond,
+    TorchJRSOThird,
     TorchRecSysOnly,
     TwoStageBaseline,
 )
@@ -266,6 +267,50 @@ def _write_metrics_csv(results: dict[str, dict[str, Any]], path: Path) -> None:
             writer.writerow(row)
 
 
+def _summarize_uplift(results: dict[str, dict[str, Any]]) -> dict[str, dict[str, float]]:
+    def safe_pct(numerator: float, denominator: float) -> float:
+        if abs(denominator) < 1e-9:
+            return 0.0
+        return float((numerator - denominator) / abs(denominator))
+
+    def metric(name: str, key: str, root: str) -> float:
+        return float(results[name][root].get(key, 0.0))
+
+    uplift: dict[str, dict[str, float]] = {}
+    for challenger in ("JRSO", "JRSO_second", "JRSO_third"):
+        if challenger in results and "RecSys-Only" in results:
+            uplift[f"{challenger}_vs_RecSys-Only"] = {
+                "ndcg@10_pct": safe_pct(
+                    metric(challenger, "ndcg@10", "recommendation"),
+                    metric("RecSys-Only", "ndcg@10", "recommendation"),
+                ),
+                "weighted_spread_rate_pct": safe_pct(
+                    metric(challenger, "weighted_spread_rate", "influence"),
+                    metric("RecSys-Only", "weighted_spread_rate", "influence"),
+                ),
+                "combined_score_pct": safe_pct(
+                    results[challenger]["combined_score"],
+                    results["RecSys-Only"]["combined_score"],
+                ),
+            }
+        if challenger in results and "Two-Stage" in results:
+            uplift[f"{challenger}_vs_Two-Stage"] = {
+                "ndcg@10_pct": safe_pct(
+                    metric(challenger, "ndcg@10", "recommendation"),
+                    metric("Two-Stage", "ndcg@10", "recommendation"),
+                ),
+                "weighted_spread_rate_pct": safe_pct(
+                    metric(challenger, "weighted_spread_rate", "influence"),
+                    metric("Two-Stage", "weighted_spread_rate", "influence"),
+                ),
+                "combined_score_pct": safe_pct(
+                    results[challenger]["combined_score"],
+                    results["Two-Stage"]["combined_score"],
+                ),
+            }
+    return uplift
+
+
 def _train_model(
     model: BaseTorchRecommender,
     dataset: SparseSyntheticDataset,
@@ -279,6 +324,11 @@ def _train_model(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(config.epochs, 1),
+        eta_min=config.learning_rate * 0.15,
     )
     amp_enabled = config.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -345,8 +395,10 @@ def _train_model(
                 "spread_bonus": epoch_spread_bonus,
                 "edge_alignment": float(np.mean([entry["edge_alignment"] for entry in epoch_logs])),
                 "val_ndcg@10": float(val_ndcg if np.isfinite(val_ndcg) else 0.0),
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
             }
         )
+        scheduler.step()
 
     model.load_state_dict(best_state)
     model.artifacts.metadata["best_val_ndcg@10"] = float(best_metric if np.isfinite(best_metric) else 0.0)
@@ -478,6 +530,13 @@ def run_torch_experiment(config: TorchExperimentConfig) -> dict[str, Any]:
         config.jrso_second,
         output_dir,
     )
+    jrso_third_model = _train_model(
+        TorchJRSOThird(dataset, config.jrso_third),
+        dataset,
+        graph,
+        config.jrso_third,
+        output_dir,
+    )
 
     im_only_model = InfluenceOnlyBaseline(dataset)
     two_stage_model = TwoStageBaseline(dataset, recsys_model, graph)
@@ -523,12 +582,21 @@ def run_torch_experiment(config: TorchExperimentConfig) -> dict[str, Any]:
             alpha=config.combined_alpha,
             device=device,
         ),
+        jrso_third_model.model_name: _evaluate_trainable_model(
+            jrso_third_model,
+            dataset,
+            graph,
+            config.recommendation_k,
+            alpha=config.combined_alpha,
+            device=device,
+        ),
     }
 
     history_payload = {
         recsys_model.model_name: recsys_model.artifacts.history,
         jrso_model.model_name: jrso_model.artifacts.history,
         jrso_second_model.model_name: jrso_second_model.artifacts.history,
+        jrso_third_model.model_name: jrso_third_model.artifacts.history,
     }
     compact_results = {
         model_name: {
@@ -557,14 +625,25 @@ def run_torch_experiment(config: TorchExperimentConfig) -> dict[str, Any]:
             results["Two-Stage"]["per_item"]["weighted_spread_mean"],
             seed=config.seed + 17,
         ),
+        "JRSO_third_vs_JRSO_second_weighted_spread": paired_permutation_test(
+            results["JRSO_third"]["per_item"]["weighted_spread_mean"],
+            results["JRSO_second"]["per_item"]["weighted_spread_mean"],
+            seed=config.seed + 23,
+        ),
+        "JRSO_third_vs_Two-Stage_weighted_spread": paired_permutation_test(
+            results["JRSO_third"]["per_item"]["weighted_spread_mean"],
+            results["Two-Stage"]["per_item"]["weighted_spread_mean"],
+            seed=config.seed + 29,
+        ),
     }
+    uplift = _summarize_uplift(results)
 
     (output_dir / "torch_training_logs.json").write_text(
         json.dumps(history_payload, indent=2),
         encoding="utf-8",
     )
     (output_dir / "torch_results.json").write_text(
-        json.dumps({"config": config.to_dict(), "results": compact_results}, indent=2),
+        json.dumps({"config": config.to_dict(), "results": compact_results, "uplift": uplift}, indent=2),
         encoding="utf-8",
     )
     (output_dir / "torch_significance.json").write_text(
@@ -587,6 +666,7 @@ def run_torch_experiment(config: TorchExperimentConfig) -> dict[str, Any]:
         "device": str(device),
         "config": config.to_dict(),
         "results": compact_results,
+        "uplift": uplift,
         "pareto_frontier": frontier,
         "significance": significance,
         "output_dir": str(output_dir),

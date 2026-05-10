@@ -104,6 +104,7 @@ class CiaoExperimentConfig:
     recsys: TorchTrainingConfig
     jrso: TorchTrainingConfig
     jrso_second: TorchTrainingConfig
+    jrso_third: TorchTrainingConfig
     output_dir: Path
     recommendation_k: tuple[int, ...] = (10, 20)
     combined_alpha: float = 0.5
@@ -146,6 +147,17 @@ class CiaoExperimentConfig:
                 warmup_epochs=1,
                 seed=603,
             )
+            jrso_third = recsys.replace(
+                hidden_dim=72,
+                num_layers=3,
+                dropout=0.10,
+                learning_rate=3.5e-3,
+                negative_candidates=20,
+                spread_items_per_step=4,
+                lambda_spread=0.45,
+                warmup_epochs=1,
+                seed=604,
+            )
         elif name == "ciao_medium":
             recsys = TorchTrainingConfig(
                 hidden_dim=64,
@@ -177,6 +189,17 @@ class CiaoExperimentConfig:
                 spread_items_per_step=3,
                 warmup_epochs=3,
                 seed=703,
+            )
+            jrso_third = recsys.replace(
+                hidden_dim=112,
+                num_layers=3,
+                dropout=0.16,
+                learning_rate=3e-3,
+                negative_candidates=24,
+                spread_items_per_step=4,
+                lambda_spread=0.60,
+                warmup_epochs=4,
+                seed=704,
             )
         else:
             recsys = TorchTrainingConfig(
@@ -211,11 +234,23 @@ class CiaoExperimentConfig:
                 warmup_epochs=10,
                 seed=803,
             )
+            jrso_third = recsys.replace(
+                hidden_dim=192,
+                num_layers=4,
+                dropout=0.22,
+                learning_rate=1.2e-3,
+                negative_candidates=40,
+                spread_items_per_step=8,
+                lambda_spread=0.52,
+                warmup_epochs=12,
+                seed=804,
+            )
         return cls(
             dataset=dataset,
             recsys=recsys,
             jrso=jrso,
             jrso_second=jrso_second,
+            jrso_third=jrso_third,
             output_dir=output_dir,
         )
 
@@ -225,6 +260,7 @@ class CiaoExperimentConfig:
             "recsys": self.recsys.to_dict(),
             "jrso": self.jrso.to_dict(),
             "jrso_second": self.jrso_second.to_dict(),
+            "jrso_third": self.jrso_third.to_dict(),
             "output_dir": str(self.output_dir),
             "recommendation_k": list(self.recommendation_k),
             "combined_alpha": self.combined_alpha,
