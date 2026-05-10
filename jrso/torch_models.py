@@ -609,8 +609,9 @@ class TorchJRSOThird(TorchJRSO):
     ) -> torch.Tensor:
         src, dst = graph["edge_index"]
         affinity = torch.sigmoid(affinity_logits)
+        edge_weight = graph["edge_weight"].to(dtype=affinity.dtype)
         propagation = torch.zeros_like(affinity)
-        propagation.index_add_(0, src, graph["edge_weight"] * affinity[dst])
+        propagation.index_add_(0, src, edge_weight * affinity[dst])
         propagation = propagation / propagation.max().clamp(min=1e-6)
         centrality = graph["centrality"].to(dtype=user_repr.dtype).unsqueeze(1)
         item_expanded = item_repr.unsqueeze(0).expand_as(user_repr)
@@ -637,6 +638,7 @@ class TorchJRSOThird(TorchJRSO):
     ) -> torch.Tensor:
         del affinity_logits
         src, dst = graph["edge_index"]
+        edge_weight = graph["edge_weight"].to(dtype=affinity.dtype)
         src_repr = self.src_projection(user_repr[src])
         dst_repr = self.dst_projection(user_repr[dst])
         item_context = self.item_projection(item_repr)
@@ -645,7 +647,7 @@ class TorchJRSOThird(TorchJRSO):
             + 0.25 * (src_repr * item_context.unsqueeze(0)).sum(dim=-1)
             + 0.20 * (dst_repr * item_context.unsqueeze(0)).sum(dim=-1)
         ) / np.sqrt(user_repr.shape[1])
-        edge_prob = graph["edge_weight"] * torch.sigmoid(edge_logits) * affinity[src] * affinity[dst]
+        edge_prob = edge_weight * torch.sigmoid(edge_logits) * affinity[src] * affinity[dst]
         return edge_prob.clamp(max=0.95)
 
     def _diffusion_bonus(
