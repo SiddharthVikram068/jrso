@@ -286,6 +286,7 @@ def _train_model(
     user_positives = _positive_items_by_user(dataset.train_matrix)
     best_state = copy.deepcopy(model.state_dict())
     best_metric = float("-inf")
+    best_spread_bonus = float("-inf")
 
     for epoch in range(config.epochs):
         model.train()
@@ -310,6 +311,7 @@ def _train_model(
             )
 
         should_eval = epoch == 0 or (epoch + 1) % 2 == 0 or epoch == config.epochs - 1
+        epoch_spread_bonus = float(np.mean([entry["spread_bonus"] for entry in epoch_logs]))
         if should_eval:
             model.eval()
             with torch.no_grad():
@@ -321,8 +323,16 @@ def _train_model(
                 k_values=(10,),
             )
             val_ndcg = val_metrics["ndcg@10"]
-            if val_ndcg >= best_metric:
+            ndcg_tolerance = 1e-4
+            if (
+                val_ndcg > best_metric + ndcg_tolerance
+                or (
+                    abs(val_ndcg - best_metric) <= ndcg_tolerance
+                    and epoch_spread_bonus > best_spread_bonus
+                )
+            ):
                 best_metric = val_ndcg
+                best_spread_bonus = epoch_spread_bonus
                 best_state = copy.deepcopy(model.state_dict())
         else:
             val_ndcg = best_metric
@@ -332,7 +342,7 @@ def _train_model(
                 "epoch": float(epoch),
                 "objective": float(np.mean([entry["objective"] for entry in epoch_logs])),
                 "rec_loss": float(np.mean([entry["rec_loss"] for entry in epoch_logs])),
-                "spread_bonus": float(np.mean([entry["spread_bonus"] for entry in epoch_logs])),
+                "spread_bonus": epoch_spread_bonus,
                 "edge_alignment": float(np.mean([entry["edge_alignment"] for entry in epoch_logs])),
                 "val_ndcg@10": float(val_ndcg if np.isfinite(val_ndcg) else 0.0),
             }
@@ -340,6 +350,9 @@ def _train_model(
 
     model.load_state_dict(best_state)
     model.artifacts.metadata["best_val_ndcg@10"] = float(best_metric if np.isfinite(best_metric) else 0.0)
+    model.artifacts.metadata["best_checkpoint_spread_bonus"] = float(
+        best_spread_bonus if np.isfinite(best_spread_bonus) else 0.0
+    )
     checkpoint_path = output_dir / f"{model.model_name.lower().replace('-', '_')}.pt"
     torch.save(model.state_dict(), checkpoint_path)
     return model

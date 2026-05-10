@@ -18,6 +18,22 @@ def _row_normalize(x: np.ndarray) -> np.ndarray:
     return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-8)
 
 
+def _stratified_eval_items(popularity: np.ndarray, num_eval_items: int) -> np.ndarray:
+    candidates = np.flatnonzero(popularity > 0)
+    if candidates.size <= num_eval_items:
+        return candidates.astype(np.int64)
+    ordered = candidates[np.argsort(popularity[candidates])]
+    positions = np.linspace(0, ordered.size - 1, num=num_eval_items)
+    chosen_positions = np.unique(np.round(positions).astype(np.int64))
+    if chosen_positions.size < num_eval_items:
+        remaining = np.setdiff1d(np.arange(ordered.size, dtype=np.int64), chosen_positions, assume_unique=False)
+        needed = min(num_eval_items - chosen_positions.size, remaining.size)
+        if needed > 0:
+            chosen_positions = np.sort(np.concatenate([chosen_positions, remaining[-needed:]]))
+    selected = ordered[chosen_positions[:num_eval_items]]
+    return selected[np.argsort(popularity[selected])[::-1]].astype(np.int64)
+
+
 def _weighted_pagerank(
     edge_index: np.ndarray,
     edge_weight: np.ndarray,
@@ -290,8 +306,6 @@ class SparseSyntheticDatasetGenerator:
 
     def _select_evaluation_items(self, test_matrix: np.ndarray) -> np.ndarray:
         popularity = test_matrix.sum(axis=0)
-        candidates = np.flatnonzero(popularity > 0)
-        if candidates.size == 0:
+        if not bool(np.any(popularity > 0)):
             return np.arange(min(self.config.num_eval_items, self.config.num_items), dtype=np.int64)
-        ordered = candidates[np.argsort(popularity[candidates])[::-1]]
-        return ordered[: self.config.num_eval_items].astype(np.int64)
+        return _stratified_eval_items(popularity, self.config.num_eval_items)

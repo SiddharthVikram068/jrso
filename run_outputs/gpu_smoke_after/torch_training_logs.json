@@ -1,0 +1,56 @@
+{
+  "RecSys-Only": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7089859247207642,
+      "rec_loss": 0.7089859247207642,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.035099939171844466
+    },
+    {
+      "epoch": 1.0,
+      "objective": 0.7061161796251932,
+      "rec_loss": 0.7061161796251932,
+      "spread_bonus": 0.0,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.04311308297264024
+    }
+  ],
+  "JRSO": [
+    {
+      "epoch": 0.0,
+      "objective": 0.7060312032699585,
+      "rec_loss": 0.7081383268038431,
+      "spread_bonus": 0.09365048011144002,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.052830321641657504
+    },
+    {
+      "epoch": 1.0,
+      "objective": 0.7008347709973654,
+      "rec_loss": 0.7050480842590332,
+      "spread_bonus": 0.09362952907880147,
+      "edge_alignment": 0.0,
+      "val_ndcg@10": 0.0543463108198664
+    }
+  ],
+  "JRSO_second": [
+    {
+      "epoch": 0.0,
+      "objective": 3.0310439268747964,
+      "rec_loss": 3.0440785884857178,
+      "spread_bonus": 0.08675940831502278,
+      "edge_alignment": 0.09734498957792918,
+      "val_ndcg@10": 0.057670836066859354
+    },
+    {
+      "epoch": 1.0,
+      "objective": 3.0231355826059976,
+      "rec_loss": 3.0384453932444253,
+      "spread_bonus": 0.09630805005629857,
+      "edge_alignment": 0.09755093107620876,
+      "val_ndcg@10": 0.05356019295215943
+    }
+  ]
+}

@@ -187,6 +187,126 @@ class TorchJRSO(BaseTorchRecommender):
         super().__init__(dataset, config)
         self.seed_bias = nn.Parameter(torch.zeros(dataset.config.num_users))
 
+    def _affinity_logits(self, user_repr: torch.Tensor, item_repr: torch.Tensor) -> torch.Tensor:
+        return (user_repr * item_repr.unsqueeze(0)).sum(dim=-1) / np.sqrt(user_repr.shape[1])
+
+    def _seed_logits(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        affinity_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        del user_repr, item_repr, graph
+        return affinity_logits + self.seed_bias
+
+    def _edge_probabilities(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        affinity_logits: torch.Tensor,
+        affinity: torch.Tensor,
+    ) -> torch.Tensor:
+        del item_repr, affinity_logits
+        src, dst = graph["edge_index"]
+        structural = torch.sigmoid((user_repr[src] * user_repr[dst]).sum(dim=-1) / np.sqrt(user_repr.shape[1]))
+        edge_prob = graph["edge_weight"] * structural * affinity[src] * affinity[dst]
+        return edge_prob.clamp(max=0.95)
+
+    @staticmethod
+    def _coverage_aware_seed_selection(
+        candidates: np.ndarray,
+        affinity: np.ndarray,
+        downstream: np.ndarray,
+        edge_src: np.ndarray,
+        edge_dst: np.ndarray,
+        edge_prob: np.ndarray,
+        centrality: np.ndarray,
+        k: int,
+    ) -> list[int]:
+        num_users = affinity.shape[0]
+        candidate_map = np.full(num_users, -1, dtype=np.int64)
+        candidate_map[candidates] = np.arange(candidates.shape[0], dtype=np.int64)
+        local_src = candidate_map[edge_src]
+        outgoing_targets: list[list[int]] = [[] for _ in range(candidates.shape[0])]
+        outgoing_probs: list[list[float]] = [[] for _ in range(candidates.shape[0])]
+        for source_local, target_idx, probability in zip(local_src, edge_dst, edge_prob):
+            if source_local >= 0 and probability > 0.0:
+                outgoing_targets[int(source_local)].append(int(target_idx))
+                outgoing_probs[int(source_local)].append(float(probability))
+
+        residual = np.ones(num_users, dtype=np.float64)
+        selected = np.zeros(candidates.shape[0], dtype=bool)
+        seeds: list[int] = []
+        centrality = centrality / max(float(centrality.max()), 1e-8)
+
+        while len(seeds) < min(k, candidates.shape[0]):
+            best_local = -1
+            best_gain = float("-inf")
+            for local_idx, node_idx in enumerate(candidates):
+                if selected[local_idx]:
+                    continue
+                gain = float(affinity[node_idx] * residual[node_idx] + 0.05 * centrality[node_idx])
+                if outgoing_targets[local_idx]:
+                    targets = np.asarray(outgoing_targets[local_idx], dtype=np.int64)
+                    probabilities = np.asarray(outgoing_probs[local_idx], dtype=np.float64)
+                    gain += float(np.sum(residual[targets] * probabilities * downstream[targets]))
+                if gain > best_gain:
+                    best_gain = gain
+                    best_local = local_idx
+            if best_local < 0:
+                break
+            chosen = int(candidates[best_local])
+            seeds.append(chosen)
+            selected[best_local] = True
+            residual[chosen] = 0.0
+            if outgoing_targets[best_local]:
+                targets = np.asarray(outgoing_targets[best_local], dtype=np.int64)
+                probabilities = np.asarray(outgoing_probs[best_local], dtype=np.float64)
+                residual[targets] *= 1.0 - probabilities
+        return seeds
+
+    def _graph_aware_seeds(
+        self,
+        seed_logits: torch.Tensor,
+        affinity: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        edge_prob: torch.Tensor,
+    ) -> list[int]:
+        edge_src = graph["edge_index"][0].detach().cpu().numpy()
+        edge_dst = graph["edge_index"][1].detach().cpu().numpy()
+        edge_prob_np = edge_prob.detach().cpu().numpy().astype(np.float64)
+        affinity_np = affinity.detach().cpu().numpy().astype(np.float64)
+        seed_logits_np = seed_logits.detach().cpu().numpy().astype(np.float64)
+        centrality_np = graph["centrality"].detach().cpu().numpy().astype(np.float64)
+
+        downstream = affinity_np.copy()
+        for _ in range(max(1, self.config.diffusion_steps - 1)):
+            propagated = np.zeros_like(downstream)
+            np.add.at(propagated, edge_src, edge_prob_np * downstream[edge_dst])
+            downstream = affinity_np + propagated
+        downstream = downstream / max(float(downstream.max()), 1e-8)
+
+        k = self.dataset.config.k_seeds
+        candidate_budget = min(affinity_np.shape[0], max(k * 6, 128))
+        seed_rank = np.argsort(seed_logits_np)[-candidate_budget:]
+        spread_rank = np.argsort(downstream + 0.10 * centrality_np)[-candidate_budget:]
+        candidates = np.unique(np.concatenate([seed_rank, spread_rank]))
+        ordering = np.argsort(seed_logits_np[candidates] + 0.45 * downstream[candidates] + 0.05 * centrality_np[candidates])[::-1]
+        candidates = candidates[ordering][:candidate_budget]
+
+        return self._coverage_aware_seed_selection(
+            candidates=candidates,
+            affinity=affinity_np,
+            downstream=downstream,
+            edge_src=edge_src,
+            edge_dst=edge_dst,
+            edge_prob=edge_prob_np,
+            centrality=centrality_np,
+            k=k,
+        )
+
     def _diffusion_bonus(
         self,
         user_repr: torch.Tensor,
@@ -194,13 +314,11 @@ class TorchJRSO(BaseTorchRecommender):
         graph: dict[str, torch.Tensor],
     ) -> torch.Tensor:
         src, dst = graph["edge_index"]
-        affinity_logits = (user_repr * item_repr.unsqueeze(0)).sum(dim=-1) / np.sqrt(user_repr.shape[1])
+        affinity_logits = self._affinity_logits(user_repr, item_repr)
         affinity = torch.sigmoid(affinity_logits)
-        seed_logits = affinity_logits + self.seed_bias
+        seed_logits = self._seed_logits(user_repr, item_repr, graph, affinity_logits)
         activations = continuous_seed_probabilities(seed_logits, self.dataset.config.k_seeds)
-        structural = torch.sigmoid((user_repr[src] * user_repr[dst]).sum(dim=-1) / np.sqrt(user_repr.shape[1]))
-        edge_prob = graph["edge_weight"] * structural * affinity[src] * affinity[dst]
-        edge_prob = edge_prob.clamp(max=0.95)
+        edge_prob = self._edge_probabilities(user_repr, item_repr, graph, affinity_logits, affinity)
         hidden = activations
         for _ in range(self.config.diffusion_steps):
             safe_term = torch.clamp(1.0 - edge_prob * hidden[src], min=1e-6, max=1.0)
@@ -244,9 +362,23 @@ class TorchJRSO(BaseTorchRecommender):
         item_repr: torch.Tensor,
         graph: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        del graph
-        affinity_logits = (user_repr * item_repr.unsqueeze(0)).sum(dim=-1) / np.sqrt(user_repr.shape[1])
-        return affinity_logits + self.seed_bias
+        affinity_logits = self._affinity_logits(user_repr, item_repr)
+        return self._seed_logits(user_repr, item_repr, graph, affinity_logits)
+
+    def select_seeds(
+        self,
+        graph: dict[str, torch.Tensor],
+        item_idx: int,
+        user_repr: torch.Tensor | None = None,
+    ) -> list[int]:
+        with torch.no_grad():
+            encoded = user_repr if user_repr is not None else self.encode_users(graph)
+            item_repr = self.item_representations()[item_idx]
+            affinity_logits = self._affinity_logits(encoded, item_repr)
+            affinity = torch.sigmoid(affinity_logits)
+            seed_logits = self._seed_logits(encoded, item_repr, graph, affinity_logits)
+            edge_prob = self._edge_probabilities(encoded, item_repr, graph, affinity_logits, affinity)
+        return self._graph_aware_seeds(seed_logits=seed_logits, affinity=affinity, graph=graph, edge_prob=edge_prob)
 
 
 class TorchJRSOSecond(TorchJRSO):
@@ -299,24 +431,31 @@ class TorchJRSOSecond(TorchJRSO):
         )
         return self.affinity_head(features).squeeze(-1)
 
-    def _diffusion_bonus(
+    def _seed_logits(
         self,
         user_repr: torch.Tensor,
         item_repr: torch.Tensor,
         graph: dict[str, torch.Tensor],
+        affinity_logits: torch.Tensor,
     ) -> torch.Tensor:
-        src, dst = graph["edge_index"]
-        affinity_logits = self._affinity_logits(user_repr, item_repr)
-        affinity = torch.sigmoid(affinity_logits)
         item_expanded = item_repr.unsqueeze(0).expand_as(user_repr)
-        centrality = graph["centrality"].unsqueeze(1)
+        centrality_tensor = graph["centrality"].to(dtype=user_repr.dtype).unsqueeze(1)
         seed_features = torch.cat(
-            [user_repr, item_expanded, user_repr * item_expanded, torch.abs(user_repr - item_expanded), centrality],
+            [user_repr, item_expanded, user_repr * item_expanded, torch.abs(user_repr - item_expanded), centrality_tensor],
             dim=-1,
         )
-        seed_logits = self.seed_head(seed_features).squeeze(-1) + 0.35 * affinity_logits + self.seed_bias
-        activations = continuous_seed_probabilities(seed_logits, self.dataset.config.k_seeds)
+        return self.seed_head(seed_features).squeeze(-1) + 0.35 * affinity_logits + self.seed_bias
 
+    def _edge_probabilities(
+        self,
+        user_repr: torch.Tensor,
+        item_repr: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        affinity_logits: torch.Tensor,
+        affinity: torch.Tensor,
+    ) -> torch.Tensor:
+        del affinity_logits
+        src, dst = graph["edge_index"]
         src_repr = self.src_projection(user_repr[src])
         dst_repr = self.dst_projection(user_repr[dst])
         item_context = self.item_projection(item_repr)
@@ -326,29 +465,7 @@ class TorchJRSOSecond(TorchJRSO):
             + (dst_repr * item_context.unsqueeze(0)).sum(dim=-1)
         ) / np.sqrt(user_repr.shape[1])
         edge_prob = graph["edge_weight"] * torch.sigmoid(edge_logits) * affinity[src] * affinity[dst]
-        edge_prob = edge_prob.clamp(max=0.95)
-        hidden = activations
-        for _ in range(self.config.diffusion_steps):
-            safe_term = torch.clamp(1.0 - edge_prob * hidden[src], min=1e-6, max=1.0)
-            log_prod = torch.zeros(hidden.shape[0], device=hidden.device, dtype=hidden.dtype)
-            log_prod.index_add_(0, dst, safe_term.log())
-            hidden = 1.0 - (1.0 - hidden) * log_prod.exp()
-        return hidden.mean()
-
-    def seed_scores(
-        self,
-        user_repr: torch.Tensor,
-        item_repr: torch.Tensor,
-        graph: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        item_expanded = item_repr.unsqueeze(0).expand_as(user_repr)
-        centrality = graph["centrality"].unsqueeze(1)
-        affinity_logits = self._affinity_logits(user_repr, item_repr)
-        seed_features = torch.cat(
-            [user_repr, item_expanded, user_repr * item_expanded, torch.abs(user_repr - item_expanded), centrality],
-            dim=-1,
-        )
-        return self.seed_head(seed_features).squeeze(-1) + 0.35 * affinity_logits + self.seed_bias
+        return edge_prob.clamp(max=0.95)
 
     def compute_loss(
         self,

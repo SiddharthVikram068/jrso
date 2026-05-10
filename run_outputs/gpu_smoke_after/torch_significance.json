@@ -1,0 +1,12 @@
+{
+  "JRSO_second_vs_JRSO_weighted_spread": {
+    "observed_mean_difference": 2.3704507615831134,
+    "p_value": 0.43428285857071464,
+    "significant": false
+  },
+  "JRSO_second_vs_Two-Stage_weighted_spread": {
+    "observed_mean_difference": 1.3211082882351342,
+    "p_value": 0.7206396801599201,
+    "significant": false
+  }
+}
